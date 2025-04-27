@@ -1,0 +1,24 @@
+schema_version = "1.0.0"
+id = "cylinder_deformer"
+version = "1.4.0"
+name = "cylinder deformer"
+tagline = "cylinder deformer"
+maintainer = "Wangziwei Jiang <jwtstone@gmail.com>"
+type = "add-on"
+website = "https://jiangwzw.github.io/strokegen-user-docs/en/"
+tags = ["System"]
+blender_version_min = "4.2.0"
+# # Optional: Blender version that the extension does not support, earlier versions are supported.
+# # This can be omitted and defined later on the extensions platform if an issue is found.
+# blender_version_max = "5.1.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  ".idea/",
+  ".git/",
+  "LISCENSE", 
+  ".gitignore",
+  ".gitattributes" 
+]
