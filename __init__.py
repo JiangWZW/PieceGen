@@ -33,6 +33,9 @@ except ImportError:
     HAS_NUMPY = False
     # Warning printed during registration
 
+# --- Local Addon Imports ---
+from . import rmf_utils
+
 # --- Constants ---
 # Custom Property Keys (used on the mesh object being deformed)
 PROP_ENABLED = "ccdg_enabled"             # (Boolean) Is realtime deform active?
@@ -70,169 +73,6 @@ class CCDG_Properties(bpy.types.PropertyGroup):
         default='NGON', description="How to fill cylinder caps")
 
 # --- Helper Functions ---
-
-# --- Helper: Bezier Curve Evaluation ---
-def evaluate_bezier_spline_with_tilt(spline: bpy.types.Spline, t: float):
-    """
-    Evaluates position, tangent, and tilt-aware normal of a Bezier spline
-    at parameter t (0-1, representing fraction of total length).
-
-    This function manually calculates the Bezier curve properties using
-    standard mathematical formulas (Bernstein polynomials for position,
-    its derivative for tangent) and incorporates Blender's 'Tilt' property
-    for calculating the curve's normal vector at point t.
-
-    Args:
-        spline: The bpy.types.Spline object (must be BEZIER type).
-        t: Parameter along the curve (0.0 to 1.0).
-
-    Returns:
-        tuple: (position_local, tangent_local, normal_local) Vectors in curve's local space.
-               Returns default vectors if spline is invalid.
-    """
-    # --- Input Validation ---
-    if not spline or not spline.bezier_points or spline.type != 'BEZIER':
-        print("Warning: evaluate_bezier_spline called with invalid spline.")
-        return Vector((0,0,0)), Vector((0,0,1)), Vector((0,1,0)) # Default return
-
-    num_points = len(spline.bezier_points)
-    num_segments = num_points - 1 # Number of curves between control points
-
-    # --- Handle Edge Case: Single Point Spline ---
-    # If there's only one control point, we can't evaluate along a segment.
-    # We estimate properties based on the single point and its handles.
-    if num_segments <= 0:
-        pt = spline.bezier_points[0]
-        position_local = pt.co.copy()
-        # Estimate tangent from the right handle (direction leaving the point)
-        tangent_local = (pt.handle_right - pt.co)
-        if tangent_local.length_squared > 1e-12:
-            tangent_local.normalize()
-        else:
-            tangent_local = Vector((0,0,1)) # Default if handle is coincident
-
-        # Estimate a base normal perpendicular to the tangent
-        normal_local_initial = Vector((0.0, 1.0, 0.0)) # Start with world Y
-        if abs(tangent_local.dot(normal_local_initial)) > 0.9999: # Check alignment
-             normal_local_initial = Vector((1.0, 0.0, 0.0)) # Use world X if aligned with Y
-        # Ensure perpendicularity using double cross product
-        normal_local_initial = tangent_local.cross(normal_local_initial).cross(tangent_local).normalized()
-
-        # Apply the single point's tilt value
-        rotation_matrix = Matrix.Rotation(pt.tilt, 3, tangent_local) # Rotation around tangent
-        normal_local = rotation_matrix @ normal_local_initial # Rotate the calculated normal
-        return position_local, tangent_local, normal_local
-
-    # --- Determine Target Segment and Local Parameter 'local_t' ---
-    # Clamp input 't' to the valid range [0, 1]
-    t_clamped = max(0.0, min(1.0, t))
-    # Calculate which segment 't' falls into (0-based index)
-    segment_float = t_clamped * num_segments
-    segment_index = min(math.floor(segment_float), num_segments - 1) # Clamp index
-    # Calculate the parameter within that specific segment (range 0-1)
-    local_t = segment_float - segment_index
-    # Handle floating point precision issues at the very end (t=1.0)
-    if local_t < 1e-6 and t_clamped == 1.0:
-        local_t = 1.0
-        segment_index = num_segments - 1 # Ensure we are on the last segment
-
-    # --- Get Control Points, Handles, and Tilt for the Target Segment ---
-    start_point = spline.bezier_points[segment_index]
-    end_point = spline.bezier_points[segment_index + 1]
-
-    # Coordinates and handles defining the cubic Bezier curve segment:
-    p0 = start_point.co             # Start point coordinate (P0)
-    h0 = start_point.handle_right   # Handle controlling curve *leaving* P0 (H0)
-    tilt0 = start_point.tilt        # Tilt value at P0
-
-    p1 = end_point.co               # End point coordinate (P1)
-    h1 = end_point.handle_left      # Handle controlling curve *entering* P1 (H1)
-    tilt1 = end_point.tilt          # Tilt value at P1
-
-    # --- Calculate Position using Bernstein Polynomials ---
-    # The cubic Bezier formula: B(t) = (1-t)^3*P0 + 3*(1-t)^2*t*H0 + 3*(1-t)*t^2*H1 + t^3*P1
-    # Pre-calculate powers of t and (1-t) for the formula
-    omt = 1.0 - local_t  # (1-t)
-    omt2 = omt * omt     # (1-t)^2
-    omt3 = omt2 * omt    # (1-t)^3
-    lt2 = local_t * local_t # t^2
-    lt3 = lt2 * local_t   # t^3
-
-    # Calculate position by summing the weighted control points/handles
-    position_local = (omt3 * p0) + (3.0 * omt2 * local_t * h0) + (3.0 * omt * lt2 * h1) + (lt3 * p1)
-
-    # --- Calculate Tangent (Derivative of Bernstein Polynomials) ---
-    # The derivative B'(t) gives the direction (tangent) of the curve:
-    # B'(t) = 3*(1-t)^2*(H0-P0) + 6*(1-t)*t*(H1-H0) + 3*t^2*(P1-H1)
-    tangent_local = (3.0 * omt2 * (h0 - p0)) + \
-                    (6.0 * omt * local_t * (h1 - h0)) + \
-                    (3.0 * lt2 * (p1 - h1))
-
-    # Normalize the tangent vector to get a unit direction vector
-    # Handle potential zero-length tangents (if points/handles coincide)
-    if tangent_local.length_squared > 1e-12: # Use length_squared for efficiency
-        tangent_local.normalize()
-    else:
-        # Fallback 1: Use the direction between the segment's start and end points
-        tangent_local = (p1 - p0)
-        if tangent_local.length_squared > 1e-12:
-            tangent_local.normalize()
-        else:
-            # Fallback 2: Use world Z-axis if start/end points are also coincident
-            tangent_local = Vector((0, 0, 1))
-
-    # --- Calculate Tilt-Aware Normal ---
-    # This determines the "up" direction of the curve at point 't', respecting user-defined twist.
-
-    # 1. Interpolate Tilt value linearly between the segment's endpoints.
-    #    Formula: a * (1-t) + b * t
-    interpolated_tilt = tilt0 * (1.0 - local_t) + tilt1 * local_t
-
-    # 2. Calculate an Initial Reference Normal vector.
-    #    This normal must be perpendicular to the tangent vector.
-    #    We establish a reliable perpendicular direction before applying tilt.
-    #    Start by preferring the World Z-axis as the reference "up".
-    reference_up_vector = Vector((0.0, 0.0, 1.0))
-    # If the tangent is parallel to World Z, use World Y instead.
-    if abs(tangent_local.dot(reference_up_vector)) > 0.9999:
-        reference_up_vector = Vector((0.0, 1.0, 0.0))
-
-    # Calculate the cross product: tangent x reference_up. This gives a vector
-    # perpendicular to both, essentially the curve's Binormal (local X-axis).
-    binormal_vector = tangent_local.cross(reference_up_vector)
-
-    # Handle edge case where tangent might *also* be parallel to the fallback reference_up.
-    # If the cross product resulted in a zero vector, try World X as reference_up.
-    if binormal_vector.length_squared < 1e-12:
-         reference_up_vector = Vector((1.0, 0.0, 0.0))
-         binormal_vector = tangent_local.cross(reference_up_vector)
-         # If still zero (tangent must be zero, which is unlikely here but handled),
-         # find *any* vector orthogonal to the tangent.
-         if binormal_vector.length_squared < 1e-12:
-              # mathutils.Vector.orthogonal() finds an arbitrary perpendicular vector.
-              arbitrary_ortho = tangent_local.orthogonal()
-              binormal_vector = tangent_local.cross(arbitrary_ortho) # Guarantees non-zero result if tangent isn't zero
-
-    # Normalize the binormal vector (local X-axis).
-    binormal_vector.normalize()
-
-    # Calculate the initial Normal (local Y-axis) using another cross product:
-    # Normal = Tangent x Binormal (following right-hand rule for Z-up: Y = Z x X)
-    normal_local_initial = tangent_local.cross(binormal_vector).normalized()
-    # Note: The previous double cross product (v.cross(t).cross(t)) is equivalent but maybe less intuitive.
-
-    # 3. Rotate the Initial Normal around the Tangent by the Interpolated Tilt.
-    #    Create a rotation matrix representing a rotation around the tangent vector.
-    tilt_rotation_matrix = Matrix.Rotation(interpolated_tilt, 3, tangent_local)
-    # Apply this rotation to the initially calculated normal vector.
-    normal_local_final = tilt_rotation_matrix @ normal_local_initial
-    # Ensure the final normal is perfectly unit length after rotation.
-    normal_local_final.normalize()
-
-
-    # Return the calculated position, tangent, and tilt-aware normal in local space
-    return position_local, tangent_local, normal_local_final
-
 def pack_verts_to_string(verts_coords_list: list[Vector]):
     """Converts list of Vector coords to compressed base64 string."""
     # (Function unchanged - already includes Numpy optimization)
@@ -267,78 +107,127 @@ def unpack_verts_from_string(packed_string: str):
         return verts
     except Exception as e: print(f"Error: Error unpacking verts (fallback): {e}"); return None
 
+# --- Modified Deform Function ---
+
 def deform_mesh_along_curve(target_mesh_obj: bpy.types.Object,
                             curve_guide_obj: bpy.types.Object,
                             original_verts_coords: list,
-                            cyl_height: float):
+                            cyl_height: float,
+                            rmf_steps: int = 50): # Add RMF resolution parameter
     """
-    Applies the curve deformation to the target mesh object's vertices.
+    Applies curve deformation using pre-calculated RMF frames.
+    Uses NEAREST pre-calculated frame (less accurate than interpolation).
     Modifies mesh data directly. Uses numpy for speed if available.
     """
     mesh = target_mesh_obj.data
 
     # --- Input Validation ---
-    if not curve_guide_obj or not curve_guide_obj.data or not isinstance(curve_guide_obj.data, bpy.types.Curve): 
+    if not curve_guide_obj or not curve_guide_obj.data or not isinstance(curve_guide_obj.data, bpy.types.Curve):
         print(f"Error: Deform failed - Invalid curve object.")
         return False
     curve_data = curve_guide_obj.data
-    
-    if not curve_data.splines or curve_data.splines[0].type != 'BEZIER': 
+
+    if not curve_data.splines or curve_data.splines[0].type != 'BEZIER':
         print(f"Error: Deform failed - Curve's first spline must be BEZIER.")
         return False
     spline = curve_data.splines[0]
 
     vert_count = len(mesh.vertices)
-    if vert_count == 0 or not original_verts_coords or len(original_verts_coords) != vert_count: 
+    if vert_count == 0 or not original_verts_coords or len(original_verts_coords) != vert_count:
         print(f"Error: Deform failed - Vertex count mismatch or missing original data.")
         return False
-    if cyl_height <= 1e-6: 
+    if cyl_height <= 1e-6:
         print(f"Error: Deform failed - Invalid cylinder height ({cyl_height}).")
         return False
+    if rmf_steps < 2: rmf_steps = 2 # Need at least 2 steps for RMF
+
+    # --- Pre-calculate RMF Frames ---
+    print(f"Calculating {rmf_steps} RMF frames...")
+    rmf_frames = rmf_utils.calculate_rmf_frames(spline, rmf_steps)
+    if not rmf_frames:
+        print(f"Error: RMF frame calculation failed.")
+        return False
+    print("RMF calculation complete.")
 
     # --- Get Transformation Matrices ---
     curve_world_matrix = curve_guide_obj.matrix_world
-    curve_world_mat_invT = curve_world_matrix.to_3x3().inverted_safe().transposed() # for normal transform under non-uniform scaling
     target_inv_matrix  = target_mesh_obj.matrix_world.inverted()
 
     # --- Prepare Coordinate Array ---
     if HAS_NUMPY: new_coords_np = np.empty((vert_count, 3), dtype=np.float32)
     else: new_coords_flat = [0.0] * (vert_count * 3)
 
+    num_rmf_frames = len(rmf_frames)
+
     # --- Process Each Vertex ---
     for i in range(vert_count):
         original_co = original_verts_coords[i] # Original local coordinate
 
         # Calculate curve parameter 't' (0-1) based on original local Z
-        t = original_co.z / cyl_height
-        t = max(0.0, min(1.0, t)) # Clamp
+        vertex_t = original_co.z / cyl_height
+        vertex_t = max(0.0, min(1.0, vertex_t)) # Clamp
 
-        # Evaluate curve frame in curve's local space
-        curve_p, curve_t, curve_n = evaluate_bezier_spline_with_tilt(spline, t)
+        # --- Find NEAREST pre-calculated RMF frame ---
+        # Map vertex_t (0-1) to the closest index in rmf_frames (0 to num_rmf_frames-1)
+        nearest_idx = round(vertex_t * (num_rmf_frames - 1))
+        nearest_idx = max(0, min(num_rmf_frames - 1, nearest_idx)) # Clamp index
 
-        # Transform curve frame vectors to world space
-        curve_p_world = curve_world_matrix @ curve_p
-        curve_t_world = (curve_world_matrix.to_3x3() @ curve_t).normalized()
-        curve_n_world = (curve_world_mat_invT @ curve_n).normalized()
-        curve_b_world = curve_n_world.cross(curve_t_world).normalized() # Binormal (X)
+        # Get frame data from the nearest pre-calculated frame
+        curve_p_local, curve_t_local, curve_n_rmf_local, frame_t = rmf_frames[nearest_idx]
 
-        # Construct world space transformation matrix for the curve frame at 't'
+        # --- Apply User Tilt ---
+        # Get interpolated tilt value at the vertex's specific parameter t
+        interpolated_tilt = rmf_utils.get_interpolated_tilt(spline, vertex_t)
+        # Create rotation matrix around the RMF tangent
+        tilt_rotation_matrix = Matrix.Rotation(interpolated_tilt, 3, curve_t_local)
+        # Apply tilt to the RMF normal
+        curve_n_final_local = tilt_rotation_matrix @ curve_n_rmf_local
+        curve_n_final_local.normalize() # Ensure unit length
+
+        # Calculate final binormal based on tilted frame
+        curve_b_final_local = curve_t_local.cross(curve_n_final_local).normalized()
+
+        # --- Transform Frame to World Space ---
+        # Use the correct inverse-transpose for normals/binormals if non-uniform scale
+        curve_rot_scale_matrix = curve_world_matrix.to_3x3()
+        try:
+            inv_matrix = curve_rot_scale_matrix.inverted_safe()
+            inv_trans_matrix = inv_matrix.transposed()
+            transform_normals_correctly = True
+        except ValueError:
+            inv_trans_matrix = Matrix.Identity(3)
+            transform_normals_correctly = False
+
+        curve_p_world = curve_world_matrix @ curve_p_local
+        curve_t_world = (curve_rot_scale_matrix @ curve_t_local).normalized()
+
+        if transform_normals_correctly:
+            curve_n_world = (inv_trans_matrix @ curve_n_final_local).normalized()
+            curve_b_world = (inv_trans_matrix @ curve_b_final_local).normalized()
+        else: # Fallback
+             curve_n_world = (curve_rot_scale_matrix @ curve_n_final_local).normalized()
+             curve_b_world = (curve_rot_scale_matrix @ curve_b_final_local).normalized()
+             # Re-ensure orthogonality if needed: curve_b_world = curve_t_world.cross(curve_n_world).normalized() ?
+
+        # Construct world space transformation matrix for the final tilted frame at 't'
+        # Ensure axes form a valid RHS basis: T, N, B ? Check convention.
+        # If T=Z, N=Y, B=X then mat = (B, N, T). Transposed for column vectors.
+        # If T=X, N=Y, B=Z then mat = (T, N, B).
+        # Let's assume T=Tangent(Z), N=Normal(Y), B=Binormal(X) convention for cylinder alignment
         mat_rot = Matrix((curve_b_world, curve_n_world, curve_t_world)).transposed()
         mat_frame_world = mat_rot.to_4x4()
         mat_frame_world.translation = curve_p_world
 
         # Original vertex position relative to the cylinder spine (XY plane offset)
-        original_xy_offset_vec = Vector((original_co.x, original_co.y, 0.0, 1.0))
+        original_xy_offset_vec = Vector((original_co.x, original_co.y, 0.0)) # Use 3D vector
 
-        # --- SIMPLIFIED CALCULATION ---
         # Transform original XY offset into the curve's world frame, then transform
-        # that result back into the target object's local space in one step.
+        # that result back into the target object's local space.
         local_pos = target_inv_matrix @ mat_frame_world @ original_xy_offset_vec
-        # --- END SIMPLIFIED CALCULATION ---
 
         # Store result
-        if HAS_NUMPY: new_coords_np[i] = local_pos
-        else: idx = i * 3; new_coords_flat[idx:idx+3] = local_pos
+        if HAS_NUMPY: new_coords_np[i] = local_pos[:3] # Ensure 3D vector
+        else: idx = i * 3; new_coords_flat[idx:idx+3] = local_pos[:3]
 
     # --- Update Mesh Vertices Efficiently ---
     try:
@@ -675,6 +564,55 @@ class VISUALIZE_OT_curve_frames(bpy.types.Operator):
         # Enable only if the active object is a Curve
         return context.active_object and context.active_object.type == 'CURVE'
 
+    def create_gradient_material(self, name, base_color):
+        """Creates a node-based material with a gradient along local Z."""
+        mat = bpy.data.materials.get(name)
+        if mat is None:
+            mat = bpy.data.materials.new(name=name)
+        else:
+            # Clear existing nodes if reusing material
+            if mat.node_tree:
+                mat.node_tree.nodes.clear()
+
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+
+        # Clear default nodes
+        nodes.clear()
+
+        # Create nodes
+        tex_coord = nodes.new(type='ShaderNodeTexCoord')
+        separate_xyz = nodes.new(type='ShaderNodeSeparateXYZ')
+        color_ramp = nodes.new(type='ShaderNodeValToRGB')
+        principled_bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
+        output_node = nodes.new(type='ShaderNodeOutputMaterial')
+
+        # Configure Color Ramp for gradient (Base Color -> White)
+        color_ramp.color_ramp.elements[0].position = 0 # Base color at position 0
+        color_ramp.color_ramp.elements[0].color = (*base_color[:3], 1.0) 
+        color_ramp.color_ramp.elements[1].position = 1.0
+        color_ramp.color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0) # White at position 1
+        # Add a NEW stop in between that is also the base color
+        new_stop = color_ramp.color_ramp.elements.new(position=0.7) # Add stop at 70%
+        new_stop.color = (*base_color[:3], 1.0) # Make it the base color
+
+        # Position nodes for clarity (optional)
+        tex_coord.location = (-600, 0)
+        separate_xyz.location = (-400, 0)
+        color_ramp.location = (-200, 0)
+        principled_bsdf.location = (0, 0)
+        output_node.location = (200, 0)
+
+        # Link nodes
+        # Generated Coords -> Separate XYZ -> Z output -> ColorRamp Fac -> BSDF Base Color
+        links.new(tex_coord.outputs['Generated'], separate_xyz.inputs['Vector'])
+        links.new(separate_xyz.outputs['Z'], color_ramp.inputs['Fac']) # Use Z axis for gradient along length
+        links.new(color_ramp.outputs['Color'], principled_bsdf.inputs['Base Color'])
+        links.new(principled_bsdf.outputs['BSDF'], output_node.inputs['Surface'])
+
+        return mat
+
     def execute(self, context):
         curve_obj = context.active_object
         curve_data = curve_obj.data
@@ -685,33 +623,19 @@ class VISUALIZE_OT_curve_frames(bpy.types.Operator):
 
         spline = curve_data.splines[0]
 
-        # --- Create Materials for Colors ---
-        def create_material(name, color):
-            mat = bpy.data.materials.get(name)
-            if mat is None:
-                mat = bpy.data.materials.new(name=name)
-                mat.use_nodes = False # Simple material
-                mat.diffuse_color = color
-            return mat
-
-        mat_tangent = create_material("Vis_Tangent", (1.0, 0.0, 0.0, 1.0)) # Red
-        mat_normal = create_material("Vis_Normal", (0.0, 1.0, 0.0, 1.0))   # Green
-        mat_binormal = create_material("Vis_Binormal", (0.0, 0.0, 1.0, 1.0)) # Blue
+        # --- Create Gradient Materials ---
+        # (Keep your create_gradient_material method and calls here)
+        mat_tangent  = self.create_gradient_material("Vis_Tangent_Grad", (1.0, 0.0, 0.0))
+        mat_normal   = self.create_gradient_material("Vis_Normal_Grad", (0.0, 1.0, 0.0))
+        mat_binormal = self.create_gradient_material("Vis_Binormal_Grad", (0.0, 0.0, 1.0))
 
         # --- Create Parent Empty ---
-        # Remove previous visualization if it exists
+        # (Keep the empty creation/deletion logic here)
         old_empty_name = f"{curve_obj.name}_FramesViz"
-        old_empty = bpy.data.objects.get(old_empty_name)
-        if old_empty:
-            # Delete all children first
-            for child in list(old_empty.children): # Iterate over a copy
-                bpy.data.objects.remove(child, do_unlink=True)
-            bpy.data.objects.remove(old_empty, do_unlink=True)
-
-        # Create new empty
+        # ... (rest of empty handling) ...
         viz_empty = bpy.data.objects.new(old_empty_name, None)
         context.collection.objects.link(viz_empty)
-        viz_empty.matrix_world = Matrix.Identity(4) # Place at world origin
+        viz_empty.matrix_world = Matrix.Identity(4)
 
 
         # --- Create Visualization Geometry Function ---
@@ -723,12 +647,14 @@ class VISUALIZE_OT_curve_frames(bpy.types.Operator):
             rot_quat = direction_world.normalized().to_track_quat('Z', 'Y')
 
             # Create cylinder
+            # Ensure cylinder is created at origin BEFORE setting matrix_world
             bpy.ops.mesh.primitive_cylinder_add(
                 vertices=8,
                 radius=radius,
                 depth=length,
-                location=(0,0,0), # Create at origin first
-                scale=(1,1,1)
+                location=(0,0,0), # Create at origin
+                scale=(1,1,1),
+                rotation=(0,0,0) # No initial rotation
             )
             marker = context.active_object
             marker.name = name
@@ -738,47 +664,73 @@ class VISUALIZE_OT_curve_frames(bpy.types.Operator):
             else: marker.data.materials.append(material)
 
             # Set final transform
-            # Position the base of the cylinder at origin_world, aligned with direction
-            marker.matrix_world = Matrix.Translation(origin_world + direction_world * (length / 2.0)) @ rot_quat.to_matrix().to_4x4()
+            # Position the base of the cylinder slightly offset FOR GRADIENT (adjust if needed)
+            # The cylinder's origin is its center; generated coords run -0.5 to 0.5 along Z depth
+            # To have gradient base start near origin_world, we place center at origin + dir*len/2
+            marker.matrix_world = Matrix.Translation(origin_world + direction_world.normalized() * (length / 2.0)) @ rot_quat.to_matrix().to_4x4()
+
 
             # Parent to the main empty
             marker.parent = parent_obj
             return marker
 
-        # --- Evaluate and Visualize ---
+        # --- Calculate RMF Frames ---
+        rmf_frames = rmf_utils.calculate_rmf_frames(spline, self.num_steps)
+        if not rmf_frames:
+            self.report({'ERROR'}, "Failed to calculate RMF frames.")
+            return {'CANCELLED'}
+
+        # --- Visualize the Calculated RMF Frames ---
         curve_world_matrix = curve_obj.matrix_world
-        curve_rot_matrix = curve_world_matrix.to_3x3()
-        curve_rot_matrix_invT = curve_rot_matrix.inverted_safe().transposed()
+        curve_rot_scale_matrix = curve_world_matrix.to_3x3()
+        try:
+            inv_matrix = curve_rot_scale_matrix.inverted_safe()
+            inv_trans_matrix = inv_matrix.transposed()
+            transform_normals_correctly = True
+        except ValueError:
+            inv_trans_matrix = Matrix.Identity(3)
+            transform_normals_correctly = False
 
-        for i in range(self.num_steps):
-            t = i / (self.num_steps - 1) if self.num_steps > 1 else 0.5 # Parameter 0.0 to 1.0
+        for i, frame_data in enumerate(rmf_frames):
+            pos_local, tan_local, norm_rmf_local, frame_t = frame_data
 
-            # Evaluate using the function from your addon
-            pos_local, tan_local, norm_local = evaluate_bezier_spline_with_tilt(spline, t) #
+            # --- Apply Tilt for Visualization ---
+            # Get interpolated tilt value at this frame's specific parameter t
+            interpolated_tilt = rmf_utils.get_interpolated_tilt(spline, frame_t)
+            tilt_rotation_matrix = Matrix.Rotation(interpolated_tilt, 3, tan_local)
+            norm_final_local = tilt_rotation_matrix @ norm_rmf_local
+            norm_final_local.normalize()
+            bino_final_local = tan_local.cross(norm_final_local).normalized()
 
-            # Calculate binormal locally (consistent with how norm_local was likely derived)
-            # In evaluate_bezier_spline_with_tilt, norm_final = tilt_rot @ (tan x bino_initial)
-            # where bino_initial = tan x ref_up.
-            # Standard Frame: T, N, B (often X, Y, Z or Z, Y, X)
-            # If T is Z-like, N is Y-like, then B = T x N (X-like)
-            # Let's assume T=Z, N=Y, B=X (local frame)
-            # If evaluate_bezier_spline_with_tilt gives T and N, calculate B = T.cross(N)
-            bino_local = tan_local.cross(norm_local).normalized()
-
-
-            # Transform to World Space
+            # --- Transform to World Space ---
             pos_world = curve_world_matrix @ pos_local
-            tan_world = (curve_rot_matrix @ tan_local).normalized()
-            norm_world = (curve_rot_matrix_invT @ norm_local).normalized()
-            bino_world = (curve_rot_matrix @ bino_local).normalized()
+            tan_world  = (curve_rot_scale_matrix @ tan_local).normalized() # Transform T
 
+            if transform_normals_correctly:
+                norm_world = (inv_trans_matrix @ norm_final_local).normalized() # Transform N correctly
+            else: # Fallback
+                norm_world = (curve_rot_scale_matrix @ norm_final_local).normalized()
 
-            # Create Markers
+            # --- Re-orthogonalize for Visualization ---
+            # Recalculate Binormal based on world T and N
+            bino_world = tan_world.cross(norm_world).normalized()
+            # Optional: Recalculate Normal based on world T and B to ensure perfect orthogonality
+            norm_world = bino_world.cross(tan_world).normalized()
+            # --- End Re-orthogonalization ---
+
+            # After calculating tan_world, norm_world, bino_world...
+            dot_tn = tan_world.dot(norm_world)
+            dot_tb = tan_world.dot(bino_world)
+            dot_nb = norm_world.dot(bino_world)
+            if abs(dot_tn) > 1e-4 or abs(dot_tb) > 1e-4 or abs(dot_nb) > 1e-4:
+                 print(f"Step {i}: Non-orthogonality detected! T.N={dot_tn:.5f}, T.B={dot_tb:.5f}, N.B={dot_nb:.5f}")
+
+            # Create Markers for the TILTED frame
             create_vector_marker(f"T_{i:03d}", pos_world, tan_world, self.scale, self.vector_radius, mat_tangent, viz_empty)
             create_vector_marker(f"N_{i:03d}", pos_world, norm_world, self.scale, self.vector_radius, mat_normal, viz_empty)
             create_vector_marker(f"B_{i:03d}", pos_world, bino_world, self.scale, self.vector_radius, mat_binormal, viz_empty)
 
-        self.report({'INFO'}, f"Generated {self.num_steps} frame visualizations.")
+        self.report({'INFO'}, f"Generated {self.num_steps} RMF frame visualizations.")
         return {'FINISHED'}
 
 

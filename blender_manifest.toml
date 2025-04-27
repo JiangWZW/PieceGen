@@ -21,4 +21,5 @@ paths_exclude_pattern = [
   "LISCENSE", 
   ".gitignore",
   ".gitattributes" 
+  "*.md"
 ]
