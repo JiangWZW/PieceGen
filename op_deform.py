@@ -16,13 +16,13 @@ from .prop_serialization import pack_verts_to_string, unpack_verts_from_string
 # Use bezier/RMF functions
 from . import bezier
 
-# --- Core Deformation Function ---
-# This function performs the actual mesh deformation based on the curve
+# --- Core Deformation Function (Multi-Frame Weighted Blend Version) ---
 def deform_mesh_along_curve(target_mesh_obj: bpy.types.Object,
                             curve_guide_obj: bpy.types.Object,
                             original_verts_coords: list,
                             cyl_height: float,
-                            rmf_steps: int = 50): # Default RMF steps
+                            rmf_steps: int = 50,
+                            influence_count: int = 4): # Number of frames to blend
     """
     Applies curve deformation using pre-calculated RMF frames.
     Uses NEAREST pre-calculated frame (Simplification).
@@ -54,16 +54,13 @@ def deform_mesh_along_curve(target_mesh_obj: bpy.types.Object,
         print(f"Error: Deform failed - Invalid cylinder height ({cyl_height}).")
         return False
     if rmf_steps < 2: rmf_steps = 2 # Ensure minimum steps for RMF logic
+    influence_count = max(2, influence_count) # Need at least 2 for blending
 
     # --- Pre-calculate RMF Frames ---
-    # print(f"Calculating {rmf_steps} RMF frames...") # Optional debug print
-    # Call function from bezier module
     rmf_frames = bezier.calculate_rmf_frames(spline, rmf_steps)
-    if not rmf_frames:
-        # Error message printed inside calculate_rmf_frames
-        return False
-    # print("RMF calculation complete.") # Optional debug print
+    if not rmf_frames: return False
     num_rmf_frames = len(rmf_frames)
+    if num_rmf_frames < 2: return False # Cannot blend with fewer than 2 frames
 
     # --- Get Transformation Matrices ---
     curve_world_matrix = curve_guide_obj.matrix_world
@@ -80,287 +77,326 @@ def deform_mesh_along_curve(target_mesh_obj: bpy.types.Object,
         transform_normals_correctly = False
         # print("Warning: Curve matrix not invertible, normal transform may be incorrect.")
 
+    # --- Pre-calculate World Frame Data (Position & Quaternion) ---
+    # Store world position and world orientation quaternion for each RMF frame.
+    world_frame_data = []
+    print(f"Pre-calculating {num_rmf_frames} world frame positions & quaternions...") # Debug
+    for frame_data in rmf_frames:
+        pos_local, tan_local, norm_rmf_local, frame_t = frame_data
+
+        # Apply tilt locally
+        interpolated_tilt = bezier.get_interpolated_tilt(spline, frame_t)
+        tilt_rot = Matrix.Rotation(interpolated_tilt, 3, tan_local)
+        norm_final_local = tilt_rot @ norm_rmf_local
+        norm_final_local.normalize()
+        bino_final_local = tan_local.cross(norm_final_local).normalized()
+        # Ensure normal is orthogonal after potential precision loss
+        norm_final_local = bino_final_local.cross(tan_local).normalized()
+
+        # Transform position to world
+        pos_world = curve_world_matrix @ pos_local
+
+        # Transform orientation vectors to world
+        tan_world = (curve_rot_scale_matrix @ tan_local).normalized()
+        if transform_normals_correctly:
+            norm_world = (inv_trans_matrix @ norm_final_local).normalized()
+            bino_world = (inv_trans_matrix @ bino_final_local).normalized()
+        else:
+            norm_world = (curve_rot_scale_matrix @ norm_final_local).normalized()
+            bino_world = (curve_rot_scale_matrix @ bino_final_local).normalized()
+
+        # Re-orthogonalize world frame just in case
+        bino_world = tan_world.cross(norm_world).normalized()
+        if bino_world.length_squared > 1e-9:
+             norm_world = bino_world.cross(tan_world).normalized()
+
+        # Create world rotation matrix and convert to quaternion
+        mat_rot_world = Matrix((bino_world, norm_world, tan_world)).transposed()
+        quat_world = mat_rot_world.to_quaternion()
+
+        # Store world position, world quaternion, and original frame t
+        world_frame_data.append({'pos': pos_world, 'quat': quat_world, 't': frame_t})
+    print("World frame data calculated.") # Debug
+
+
     # --- Prepare Coordinate Array ---
     # Use numpy array for potentially faster operations if available
-    if HAS_NUMPY:
-        new_coords_np = np.empty((vert_count, 3), dtype=np.float32)
-    else:
-        # Fallback to standard list if numpy not installed
-        new_coords_flat = [0.0] * (vert_count * 3)
+    if HAS_NUMPY: new_coords_np = np.empty((vert_count, 3), dtype=np.float32)
+    else: new_coords_flat = [0.0] * (vert_count * 3) # Fallback to standard list if numpy not installed
 
     # --- Process Each Vertex ---
     for i in range(vert_count):
         original_co = original_verts_coords[i] # Original local coordinate
-
         # Calculate curve parameter 't' (0-1) based on original local Z and height
         vertex_t = original_co.z / cyl_height
         vertex_t = max(0.0, min(1.0, vertex_t)) # Clamp t to [0, 1]
 
-        # --- Find Bracketing RMF Frames and Interpolation Factor ---
-        t: float = vertex_t * (num_rmf_frames - 1)
-        prev_frame_id = math.floor(t)
-        next_frame_id = math.ceil(t)
+        # --- Find Influencing Frames and Calculate Weights ---
+        # Determine the 'central' index based on t
+        t_scaled = vertex_t * (num_rmf_frames - 1)
+        center_idx_float = t_scaled
+        center_idx_int = int(round(center_idx_float)) # Nearest frame index
 
-        if prev_frame_id == next_frame_id or num_rmf_frames <= next_frame_id: 
-            # Handle edge cases where vertex_t lands exactly on a frame
-            prev_frame_id = max(0, min(num_rmf_frames - 1, prev_frame_id))
-            interp_factor = .0
-            frame_prev = rmf_frames[prev_frame_id]
-            frame_next = frame_prev
-        else: 
-            frame_prev, frame_next = rmf_frames[prev_frame_id], rmf_frames[next_frame_id]
-            # Calculate interpolation factor between frame_prev.t and frame_next.t
-            t_prev_param, t_next_param = frame_prev[3], frame_next[3] # Global t of prev/next frame
-            if abs(t_next_param - t_prev_param) < 1e-9: # Avoid division by zero if frame t's are identical
-                interp_factor = 0.0
-            else: interp_factor = (vertex_t - t_prev_param) / (t_next_param - t_prev_param)
-            interp_factor = max(0.0, min(1.0, interp_factor)) # Clamp factor
-        
-        # --- Interpolate Frame Data ---
-        # Unpack frame data
-        p_prev, t_prev, n_prev, _ = frame_prev
-        p_next, t_next, n_next, _ = frame_next
+        # Determine the range of indices to consider (e.g., 4 nearest)
+        # Calculate start index, ensuring it doesn't go below 0
+        half_influence = influence_count // 2
+        start_idx = max(0, center_idx_int - half_influence + (1 if influence_count % 2 == 0 else 0) ) # Adjust for even counts
+        # Calculate end index, ensuring it doesn't exceed bounds
+        end_idx = min(num_rmf_frames, start_idx + influence_count)
+        # Adjust start index again if end index hit the boundary
+        start_idx = max(0, end_idx - influence_count)
 
-        # 1. Linear Interpolate Position (Lerp)
-        curve_p_local = p_prev.lerp(p_next, interp_factor)
+        # Get the indices of the influencing frames
+        influence_indices = range(start_idx, end_idx)
+        num_influences = len(influence_indices)
 
-        # 2. Spherical Linear Interpolate Orientation (Slerp)
-        #    Convert frame orientations (T, N) to Quaternions for Slerp
-        def quat_from_bnt(n:Vector, t:Vector): 
-            b = t.cross(n).normalized()
-            n = b.cross(t).normalized()
-            mat = Matrix((b, n, t)).transposed() # b, n, t at each column
-            quat = mat.to_quaternion()
-            return quat
-        quat_prev, quat_next = quat_from_bnt(n_prev, t_prev), quat_from_bnt(n_next, t_next)
+        # Calculate weights based on inverse distance in parameter space
+        weights = []
+        total_inv_dist = 0.0
+        epsilon = 1e-6 # To prevent division by zero
 
-        # Perform Slerp
-        quat_interp = quat_prev.slerp(quat_next, interp_factor)
+        for k in influence_indices:
+            frame_t_param = world_frame_data[k]['t']
+            dist_sq = (vertex_t - frame_t_param)**2
+            inv_dist = 1.0 / (math.sqrt(dist_sq) + epsilon)
+            weights.append(inv_dist)
+            total_inv_dist += inv_dist
 
-        # Convert interpolated quaternion back to matrix to extract T, N vectors
-        mat_interp = quat_interp.to_matrix()
-        curve_t_local = mat_interp.col[2].normalized()
-        curve_n_rmf_local = mat_interp.col[1].normalized()
+        # Normalize weights
+        if total_inv_dist > epsilon:
+            for k in range(num_influences):
+                weights[k] /= total_inv_dist
+        else:
+            # Handle case where all distances are zero (vertex_t matches a frame_t exactly)
+            # Assign full weight to the matching frame
+            exact_match_idx_local = -1
+            for k_idx, k_frame_idx in enumerate(influence_indices):
+                 if abs(vertex_t - world_frame_data[k_frame_idx]['t']) < epsilon:
+                      exact_match_idx_local = k_idx
+                      break
+            if exact_match_idx_local != -1:
+                 for k in range(num_influences): weights[k] = 0.0
+                 weights[exact_match_idx_local] = 1.0
+            else: # Should not happen if epsilon is small, but fallback: equal weights
+                 for k in range(num_influences): weights[k] = 1.0 / num_influences
 
-        # --- Apply User Tilt ---
-        # Get interpolated tilt value at the vertex's specific parameter t
-        interpolated_tilt = bezier.get_interpolated_tilt(spline, vertex_t)
-        # Create rotation matrix around the RMF tangent (local to curve)
-        tilt_rotation_matrix = Matrix.Rotation(interpolated_tilt, 3, curve_t_local)
-        # Apply tilt to the RMF normal (local to curve)
-        curve_n_final_local = tilt_rotation_matrix @ curve_n_rmf_local
-        curve_n_final_local.normalize() # Ensure unit length after rotation
 
-        # Calculate final binormal based on tilted frame (local to curve)
-        curve_b_final_local = curve_t_local.cross(curve_n_final_local).normalized()
-
-        # --- Transform Frame to World Space ---
-        curve_p_world = curve_world_matrix @ curve_p_local
-        # Transform tangent using standard matrix
-        curve_t_world = (curve_rot_scale_matrix @ curve_t_local).normalized()
-        # Transform normal and binormal using inverse-transpose
-        if transform_normals_correctly:
-            curve_n_world = (inv_trans_matrix @ curve_n_final_local).normalized()
-            curve_b_world = (inv_trans_matrix @ curve_b_final_local).normalized()
-        else: # Fallback if curve matrix was non-invertible
-             curve_n_world = (curve_rot_scale_matrix @ curve_n_final_local).normalized()
-             curve_b_world = (curve_rot_scale_matrix @ curve_b_final_local).normalized()
-             # Optional: Re-orthogonalize in world space if needed as fallback
-             # curve_b_world = curve_t_world.cross(curve_n_world).normalized()
-             # curve_n_world = curve_b_world.cross(curve_t_world).normalized()
-
-        # Construct world space transformation matrix for the final tilted frame at 't'
-        # Using the convention: X=Binormal, Y=Normal, Z=Tangent
-        mat_rot = Matrix((curve_b_world, curve_n_world, curve_t_world)).transposed()
-        mat_frame_world = mat_rot.to_4x4()
-        mat_frame_world.translation = curve_p_world
-
-        # Original vertex position relative to the cylinder spine (XY plane offset)
+        # --- Apply Weighted Transformation ---
         original_xy_offset_vec = Vector((original_co.x, original_co.y, 0.0))
 
-        # Transform the XY offset vector by the world frame matrix to get world position
-        world_pos = mat_frame_world @ original_xy_offset_vec
+        # Blend Positions (Linear Interpolation)
+        final_world_pos = Vector((0.0, 0.0, 0.0))
+        # Blend Orientations (NLERP - Normalized Linear Quaternion Blending)
+        final_world_quat = Quaternion((0.0, 0.0, 0.0, 0.0)) # Accumulator
+        ref_quat = None # Reference for consistent quaternion signs
+
+        for k_idx, frame_idx in enumerate(influence_indices):
+            weight = weights[k_idx]
+            frame_world_pos = world_frame_data[frame_idx]['pos']
+            frame_world_quat = world_frame_data[frame_idx]['quat'].copy() # Use copy
+
+            # --- Position Blending ---
+            final_world_pos += frame_world_pos * weight
+
+            # --- Orientation Blending (NLERP) ---
+            # Ensure quaternion signs are consistent for averaging
+            # Compare with the first contributing quaternion (or the accumulator)
+            if ref_quat is None:
+                 ref_quat = frame_world_quat
+            if ref_quat.dot(frame_world_quat) < 0.0:
+                frame_world_quat.negate() # Flip sign for shortest path
+
+            # Accumulate weighted quaternion
+            final_world_quat.w += frame_world_quat.w * weight
+            final_world_quat.x += frame_world_quat.x * weight
+            final_world_quat.y += frame_world_quat.y * weight
+            final_world_quat.z += frame_world_quat.z * weight
+
+        # Normalize the accumulated quaternion for NLERP
+        final_world_quat.normalize()
+
+        # Construct the final world transformation matrix from blended components
+        mat_frame_world = final_world_quat.to_matrix().to_4x4()
+        mat_frame_world.translation = final_world_pos
+
+        # Transform the original offset by the blended world matrix
+        world_pos_deformed = mat_frame_world @ original_xy_offset_vec
 
         # Transform the final world position back into the target object's local space
-        local_pos = target_inv_matrix @ world_pos
+        local_pos = target_inv_matrix @ world_pos_deformed
 
         # Store result
         if HAS_NUMPY:
-            new_coords_np[i] = local_pos # Store Vector directly
+            new_coords_np[i] = local_pos
         else:
             idx = i * 3
-            new_coords_flat[idx]     = local_pos.x
-            new_coords_flat[idx + 1] = local_pos.y
-            new_coords_flat[idx + 2] = local_pos.z
+            new_coords_flat[idx:idx+3] = local_pos.x, local_pos.y, local_pos.z
 
     # --- Update Mesh Vertices Efficiently ---
     try:
-        # Use foreach_set for faster vertex coordinate updates
-        if HAS_NUMPY:
-            # Ravel the numpy array to a flat list for foreach_set
-            mesh.vertices.foreach_set("co", new_coords_np.ravel())
-        else:
-            mesh.vertices.foreach_set("co", new_coords_flat)
-        # Mark mesh data as updated
-        mesh.update()
-        return True # Indicate success
-    except Exception as e:
-        # Handle potential errors during coordinate setting
-        print(f"Error: Failed to set vertex coordinates: {e}")
-        return False # Indicate failure
+        if HAS_NUMPY: mesh.vertices.foreach_set("co", new_coords_np.ravel())
+        else: mesh.vertices.foreach_set("co", new_coords_flat)
+        mesh.update(); return True
+    except Exception as e: print(f"Error: Failed to set vertex coordinates: {e}"); return False
 
-
-# --- Operator: Enable Realtime Deform ---
-class OBJECT_OT_enable_realtime_bend(bpy.types.Operator):
-    """Enables realtime deformation handler for the active mesh, linking it to the selected curve."""
-    bl_idname = "object.enable_realtime_bend"
-    bl_label = "Enable Realtime Deform"
-    bl_description = "Links active mesh to selected curve for realtime updates (Can be slow!)"
+# --- Operator: Toggle Realtime Deform ---
+class OBJECT_OT_toggle_realtime_bend(bpy.types.Operator):
+    """Toggles realtime deformation handler for the active mesh using the chosen curve."""
+    bl_idname = "object.toggle_realtime_bend" # New ID for the toggle operator
+    bl_label = "Toggle Realtime Deform"
+    bl_description = "Starts or stops realtime curve deformation for the active mesh"
     bl_options = {'REGISTER', 'UNDO'}
-
-    # Removed class variable for cache - using global cache from common_vars
 
     @classmethod
     def poll(cls, context):
-        """Enable operator only if an unlinked mesh is active and a curve is selected."""
-        active_obj = context.active_object
-        # Check if PROP_ENABLED exists and is False/None before enabling
-        is_already_enabled = active_obj.get(cvars.PROP_ENABLED, False) if active_obj else False
-        return (context.mode == 'OBJECT' and
-                active_obj and active_obj.type == 'MESH' and
-                len(context.selected_objects) == 2 and # Require exactly mesh + curve selected
-                not is_already_enabled and # Check the fetched property
-                any(obj.type == 'CURVE' for obj in context.selected_objects if obj != active_obj))
-
-    def find_curve_object(self, context):
-        """Finds the selected curve object (assumes only one other selected object)."""
-        active_obj = context.active_object
-        for obj in context.selected_objects:
-            if obj != active_obj and obj.type == 'CURVE':
-                return obj
-        return None
+        """Enable operator only if the active object is a mesh."""
+        # Curve validity is checked during execute when enabling
+        return context.active_object and context.active_object.type == 'MESH'
 
     def execute(self, context):
         target_obj = context.active_object
-        curve_obj = self.find_curve_object(context)
-
-        # Access scene properties (needed for default height if not stored)
-        if not hasattr(context.scene, 'ccdg_props'):
-             self.report({'ERROR'}, "Addon properties not found on scene.")
-             return {'CANCELLED'}
-        props = context.scene.ccdg_props
-
-        if not curve_obj:
-            self.report({'ERROR'}, "No valid curve object selected alongside the active mesh.")
+        scene = context.scene
+        # Access the scene property group where the panel stores settings
+        if not hasattr(scene, 'ccdg_props'):
+            self.report({'ERROR'}, "Addon properties not found on scene.")
             return {'CANCELLED'}
+        props = scene.ccdg_props
 
-        # --- Store original vertex data ---
-        # Copy current vertex coordinates before deformation
-        original_verts = [v.co.copy() for v in target_obj.data.vertices]
-        # Pack coordinates into a string for storage in custom property
-        packed_verts = pack_verts_to_string(original_verts) # Uses function from prop_serialization
-        if not packed_verts:
-            self.report({'ERROR'}, "Failed to pack original vertex data.")
-            return {'CANCELLED'}
+        # Check current state of the active object
+        is_enabled = target_obj.get(cvars.PROP_ENABLED, False)
 
-        # Determine the base height for mapping 't'
-        # Prefer height stored previously, fallback to current panel setting
-        stored_height = target_obj.get(cvars.PROP_HEIGHT)
-        if stored_height is None:
-            stored_height = props.height # Get height from scene properties
-            print(f"Warning: Using panel height ({stored_height:.3f}) for deformation mapping as no original height was stored on '{target_obj.name}'.")
-            # TODO: Optionally calculate bounds here as a more robust fallback if needed
+        if not is_enabled:
+            # --- Enable Logic ---
+            # Get the curve selected in the panel's PointerProperty
+            curve_obj = props.target_curve
+            if not curve_obj:
+                self.report({'ERROR'}, "No Target Curve selected in the panel.")
+                return {'CANCELLED'}
 
-        # --- Store state in global cache and object custom properties ---
-        cvars.original_coords_cache[target_obj.name] = original_verts # Store in global cache
-        target_obj[cvars.PROP_ENABLED] = True # Mark as enabled
-        target_obj[cvars.PROP_CURVE_NAME] = curve_obj.name # Store linked curve name
-        target_obj[cvars.PROP_ORIG_VERTS] = packed_verts # Store packed original verts
-        target_obj[cvars.PROP_HEIGHT] = stored_height # Store the height used for mapping
+            # Validate the selected curve object *before* proceeding
+            if curve_obj.type != 'CURVE' or not curve_obj.data or \
+               not curve_obj.data.splines or len(curve_obj.data.splines) == 0 or \
+               curve_obj.data.splines[0].type != 'BEZIER' or \
+               len(curve_obj.data.splines[0].bezier_points) < 2:
+                self.report({'ERROR'}, f"Selected Target Curve '{curve_obj.name}' is not a valid Bezier curve with >= 2 points.")
+                return {'CANCELLED'}
 
-        # Add object name to the set monitored by the depsgraph handler
-        cvars.MONITORED_MESH_OBJECTS.add(target_obj.name)
+            # Store original vertex data
+            self.report({'INFO'}, f"Storing original shape for '{target_obj.name}'...")
+            original_verts = [v.co.copy() for v in target_obj.data.vertices]
+            # Use packing function from prop_serialization module
+            packed_verts = pack_verts_to_string(original_verts)
+            if not packed_verts:
+                self.report({'ERROR'}, "Failed to pack original vertex data.")
+                return {'CANCELLED'}
 
-        # --- Apply initial deformation ---
-        self.report({'INFO'}, "Applying initial deformation...")
-        # Call the deformation function defined in this module
-        success = deform_mesh_along_curve(target_obj, curve_obj, original_verts, stored_height)
+            # Determine base height for mapping t
+            # Prefer height stored previously on the object, fallback to current generation panel setting
+            stored_height = target_obj.get(cvars.PROP_HEIGHT)
+            if stored_height is None:
+                # Use height from generation panel settings if not found on object
+                stored_height = props.height # Get height from scene properties
+                print(f"Warning: Using panel height ({stored_height:.3f}) for deform mapping on '{target_obj.name}'. Ensure this matches the mesh.")
 
-        if success:
-            self.report({'INFO'}, f"Enabled realtime deform for '{target_obj.name}' linked to '{curve_obj.name}'.")
-            context.area.tag_redraw() # Update UI to reflect enabled state
-            return {'FINISHED'}
+            # Store state in global cache (common_vars) and object custom properties (common_vars)
+            cvars.original_coords_cache[target_obj.name] = original_verts
+            target_obj[cvars.PROP_ENABLED] = True
+            target_obj[cvars.PROP_CURVE_NAME] = curve_obj.name # Store linked curve name
+            target_obj[cvars.PROP_ORIG_VERTS] = packed_verts
+            target_obj[cvars.PROP_HEIGHT] = stored_height # Store the height used for mapping
+
+            # Add object name to the set monitored by the depsgraph handler
+            cvars.MONITORED_MESH_OBJECTS.add(target_obj.name)
+
+            # Apply initial deformation
+            self.report({'INFO'}, "Applying initial deformation...")
+            # Get RMF steps from the panel property
+            rmf_steps = props.rmf_steps_deform
+            # Call the deformation function defined in this module
+            success = deform_mesh_along_curve(target_obj, curve_obj, original_verts, stored_height, rmf_steps)
+
+            if success:
+                self.report({'INFO'}, f"Started realtime deform for '{target_obj.name}' with '{curve_obj.name}'.")
+                # --- Switch context for immediate curve editing ---
+                try:
+                    # Deselect mesh, select curve, make curve active
+                    target_obj.select_set(False)
+                    curve_obj.select_set(True)
+                    context.view_layer.objects.active = curve_obj
+                    # Switch to Edit mode if not already there
+                    if context.mode != 'EDIT_CURVE':
+                        bpy.ops.object.mode_set(mode='EDIT')
+                except Exception as e:
+                    # Don't cancel if context switch fails, just warn
+                    print(f"Warning: Could not switch context to curve edit mode: {e}")
+                # Update the UI panel
+                context.area.tag_redraw()
+                return {'FINISHED'}
+            else:
+                # Clean up if initial deformation failed
+                target_obj.pop(cvars.PROP_ENABLED, None); target_obj.pop(cvars.PROP_CURVE_NAME, None)
+                target_obj.pop(cvars.PROP_ORIG_VERTS, None); target_obj.pop(cvars.PROP_HEIGHT, None)
+                cvars.original_coords_cache.pop(target_obj.name, None)
+                cvars.MONITORED_MESH_OBJECTS.discard(target_obj.name)
+                self.report({'ERROR'}, "Initial deformation failed."); return {'CANCELLED'}
+
         else:
-            # Clean up if initial deformation failed
+            # --- Disable Logic ---
+            mesh = target_obj.data
+            obj_name = target_obj.name
+            self.report({'INFO'}, f"Stopping realtime deform for '{obj_name}'.")
+
+            # Restore original shape
+            packed_verts = target_obj.get(cvars.PROP_ORIG_VERTS)
+            if packed_verts:
+                # Use unpacking function from prop_serialization module
+                original_verts = unpack_verts_from_string(packed_verts)
+                # Check if unpacking was successful and vertex count matches current mesh
+                if original_verts and len(original_verts) == len(mesh.vertices):
+                     try:
+                         # Prepare flat list for foreach_set
+                         if HAS_NUMPY: # Use numpy if available
+                              flat_coords = np.array(original_verts, dtype=np.float32).ravel()
+                         else:
+                              flat_coords = [c for v_co in original_verts for c in v_co]
+                         # Apply original coordinates back to the mesh
+                         mesh.vertices.foreach_set("co", flat_coords)
+                         mesh.update() # Update mesh state
+                         # print(f"Restored original shape for '{obj_name}'.") # Report below
+                     except Exception as e:
+                         self.report({'ERROR'}, f"Failed to restore vertex coords for '{obj_name}': {e}")
+                elif original_verts:
+                    # Vertex count mismatch - cannot restore reliably
+                    self.report({'WARNING'}, f"Could not restore '{obj_name}': Vertex count changed since deform was enabled.")
+                else:
+                    # Unpacking failed
+                    self.report({'WARNING'}, f"Could not restore '{obj_name}': Failed to unpack original vertex data.")
+            else:
+                # No original data found - maybe it was cleared or never set
+                self.report({'WARNING'}, f"No original shape data found for '{obj_name}'. Cannot restore.")
+
+            # --- Cleanup State ---
+            # Remove object from monitored set (common_vars)
+            cvars.MONITORED_MESH_OBJECTS.discard(obj_name)
+            # Remove custom properties from the object (using keys from common_vars)
             target_obj.pop(cvars.PROP_ENABLED, None)
             target_obj.pop(cvars.PROP_CURVE_NAME, None)
             target_obj.pop(cvars.PROP_ORIG_VERTS, None)
             target_obj.pop(cvars.PROP_HEIGHT, None)
-            cvars.original_coords_cache.pop(target_obj.name, None) # Clear cache
-            cvars.MONITORED_MESH_OBJECTS.discard(target_obj.name) # Remove from monitored set
-            self.report({'ERROR'}, "Initial deformation failed.")
-            return {'CANCELLED'}
+            # Clear entry from the global coordinate cache (common_vars)
+            cvars.original_coords_cache.pop(obj_name, None)
 
-# --- Operator: Disable Realtime Deform ---
-class OBJECT_OT_disable_realtime_bend(bpy.types.Operator):
-    """Disables realtime deformation handler and restores original mesh shape."""
-    bl_idname = "object.disable_realtime_bend"
-    bl_label = "Disable Realtime Deform"
-    bl_description = "Stops realtime updates and restores original mesh shape"
-    bl_options = {'REGISTER', 'UNDO'}
+            # --- Switch context back to Object mode ---
+            if context.mode != 'OBJECT':
+                try:
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                except Exception as e:
+                    # Don't cancel if mode switch fails, just warn
+                    print(f"Warning: Could not switch back to object mode: {e}")
 
-    @classmethod
-    def poll(cls, context):
-        """Enable operator only if the active object is a mesh and currently enabled."""
-        return (context.active_object and context.active_object.type == 'MESH' and
-                context.active_object.get(cvars.PROP_ENABLED, False)) # Check enabled flag
+            self.report({'INFO'}, f"Stopped realtime deform for '{obj_name}'.")
+            # Update the UI panel
+            context.area.tag_redraw()
+            return {'FINISHED'}
 
-    def execute(self, context):
-        target_obj = context.active_object
-        mesh = target_obj.data
-        obj_name = target_obj.name
 
-        # --- Restore original shape ---
-        # Retrieve packed original vertex data from custom property
-        packed_verts = target_obj.get(cvars.PROP_ORIG_VERTS)
-        if packed_verts:
-            # Unpack the vertex data
-            original_verts = unpack_verts_from_string(packed_verts) # Uses function from prop_serialization
-            # Check if unpacking was successful and vertex count matches current mesh
-            if original_verts and len(original_verts) == len(mesh.vertices):
-                 try:
-                     # Prepare flat list for foreach_set
-                     if HAS_NUMPY: # Use numpy if available
-                          flat_coords = np.array(original_verts, dtype=np.float32).ravel()
-                     else:
-                          flat_coords = [c for v_co in original_verts for c in v_co]
-                     # Apply original coordinates back to the mesh
-                     mesh.vertices.foreach_set("co", flat_coords)
-                     mesh.update() # Update mesh state
-                     self.report({'INFO'}, f"Restored original shape for '{obj_name}'.")
-                 except Exception as e:
-                     self.report({'ERROR'}, f"Failed to restore vertex coords for '{obj_name}': {e}")
-            elif original_verts:
-                # Vertex count mismatch - cannot restore reliably
-                self.report({'WARNING'}, f"Could not restore '{obj_name}': Vertex count changed since deform was enabled.")
-            else:
-                # Unpacking failed
-                self.report({'WARNING'}, f"Could not restore '{obj_name}': Failed to unpack original vertex data.")
-        else:
-            # No original data found - maybe it was cleared or never set
-            self.report({'WARNING'}, f"No original shape data found for '{obj_name}'. Cannot restore.")
-
-        # --- Cleanup ---
-        # Remove object from monitored set
-        cvars.MONITORED_MESH_OBJECTS.discard(obj_name)
-        # Remove custom properties from the object
-        target_obj.pop(cvars.PROP_ENABLED, None)
-        target_obj.pop(cvars.PROP_CURVE_NAME, None)
-        target_obj.pop(cvars.PROP_ORIG_VERTS, None)
-        target_obj.pop(cvars.PROP_HEIGHT, None)
-        # Clear entry from the global coordinate cache
-        cvars.original_coords_cache.pop(obj_name, None)
-
-        self.report({'INFO'}, f"Disabled realtime deform for '{obj_name}'.")
-        context.area.tag_redraw() # Update UI
-        return {'FINISHED'}
