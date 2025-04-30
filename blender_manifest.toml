@@ -20,6 +20,6 @@ paths_exclude_pattern = [
   ".git/",
   "LISCENSE", 
   ".gitignore",
-  ".gitattributes" 
-  "*.md"
+  ".gitattributes", 
+  ".md"
 ]

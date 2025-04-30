@@ -1,7 +1,3 @@
-# -*- coding: utf-8 -*-
-# File: rmf_utils.py
-# Contains Rotation Minimizing Frame calculation logic
-
 import bpy # Needed for bpy.types.Spline hint, potentially others
 import math
 from mathutils import Vector, Matrix
@@ -243,20 +239,16 @@ def calculate_rmf_frames(spline: bpy.types.Spline, num_steps: int):
         else:
             # Reflect previous reference vector r_i across plane with normal v1
             ri_reflected_v1 = r_i - (2.0 / c1_sq) * v1.dot(r_i) * v1
-
-            # Reflect this intermediate vector across plane with normal t_i + t_i1
-            v2 = t_i + t_i1
+            ti_reflected_v1 = t_i - (2.0 / c1_sq) * v1.dot(t_i) * v1
+            
+            v2 = t_i1 - ti_reflected_v1
             c2_sq = v2.length_squared
-            if c2_sq < 1e-15: # Avoid division by zero if tangents are opposite
-                # If tangents are opposite, previous reflection is likely good enough?
-                # Or reflect across t_i1? Let's use the reflected ri_reflected_v1
-                r_i1 = ri_reflected_v1.copy()
-            else:
-                 r_i1 = ri_reflected_v1 - (2.0 / c2_sq) * v2.dot(ri_reflected_v1) * v2
 
+            r_i1 = ri_reflected_v1 - (2.0 / c2_sq) * v2.dot(ri_reflected_v1) * v2
 
         r_i1.normalize() # Ensure unit length
 
         frames.append((p_i1, t_i1, r_i1, curve_data[i+1]['t']))
 
     return frames
+    
