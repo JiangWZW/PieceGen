@@ -2,6 +2,8 @@ import bpy # Needed for bpy.types.Spline hint, potentially others
 import math
 from mathutils import Vector, Matrix
 
+from . import common_vars as cvars
+
 # --- Helper: Bezier Curve Derivatives ---
 
 def get_bezier_segment_data(spline: bpy.types.Spline, segment_index: int):
@@ -137,7 +139,6 @@ def get_interpolated_tilt(spline: bpy.types.Spline, global_t: float) -> float:
     return interpolated_tilt
 
 # --- RMF Calculation Function ---
-
 def calculate_rmf_frames(spline: bpy.types.Spline, num_steps: int):
     """
     Calculates a sequence of Rotation Minimizing Frames along a Bezier spline
@@ -252,3 +253,48 @@ def calculate_rmf_frames(spline: bpy.types.Spline, num_steps: int):
 
     return frames
     
+
+# --- Radius Array Initialization ---
+def ensure_radius_array(curve_data: bpy.types.Curve) -> bool:
+    """
+    Ensures the custom radius array property exists on the curve data
+    and matches the number of Bezier points. Initializes or corrects it
+    with default values (1.0) if necessary.
+
+    Args:
+        curve_data: The bpy.types.Curve data block to check/modify.
+
+    Returns:
+        bool: True if the array exists and is valid after the check, False otherwise.
+    """
+    if not curve_data or not curve_data.splines or not curve_data.splines[0].bezier_points:
+        print("Error: Cannot ensure radius array - Invalid curve data or no Bezier points.")
+        return False
+
+    prop_key = cvars.PROP_RADIUS_ARRAY
+    spline = curve_data.splines[0]
+    num_pts = len(spline.bezier_points)
+
+    try:
+        if prop_key in curve_data:
+            # Property exists, check length
+            current_array = curve_data[prop_key]
+            if len(current_array) == num_pts:
+                # print(f"Radius array already exists and length matches ({num_pts}).") # Debug
+                return True # Array exists and is correct length
+            else:
+                # Length mismatch, recreate with default values
+                print(f"Warning: Radius array length mismatch ({len(current_array)} vs {num_pts}). Recreating.")
+                curve_data[prop_key] = [1.0] * num_pts
+                return True
+        else:
+            # Property does not exist, create it
+            print(f"Initializing radius array for '{curve_data.name}' with {num_pts} points.")
+            curve_data[prop_key] = [1.0] * num_pts
+            return True
+    except Exception as e:
+        print(f"Error ensuring radius array for '{curve_data.name}': {e}")
+        # Attempt to remove potentially corrupted property
+        if prop_key in curve_data:
+            del curve_data[prop_key]
+        return False

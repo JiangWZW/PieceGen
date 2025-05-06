@@ -9,6 +9,7 @@ PROP_ENABLED = "ccdg_enabled"             # (Boolean) Is realtime deform active?
 PROP_CURVE_NAME = "ccdg_curve_name"       # (String) Name of the guide curve object
 PROP_ORIG_VERTS = "ccdg_original_verts_b64" # (String) Packed original vertex data
 PROP_HEIGHT = "ccdg_original_height"      # (Float) Original cylinder height used for mapping
+PROP_RADIUS_ARRAY = "piecegen_radius_array" # (IDP Array/List of Floats) Deformation scale per curve point
 
 # --- Global State ---
 # Stores names of mesh objects being actively deformed by the handler.

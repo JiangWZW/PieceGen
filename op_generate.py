@@ -7,7 +7,10 @@
 import bpy
 import bmesh
 from mathutils import Vector, Matrix
-# No local addon imports needed for this specific operator
+
+# --- Local Imports ---
+from . import common_vars as cvars
+from .bezier import ensure_radius_array
 
 class OBJECT_OT_generate_cylinder_with_curve(bpy.types.Operator):
     """Creates/Recreates a cylinder mesh and a Bézier curve based on Scene settings."""
@@ -192,6 +195,12 @@ class OBJECT_OT_generate_cylinder_with_curve(bpy.types.Operator):
         curve_obj.matrix_world = cyl_obj.matrix_world.copy()
         # Link the new curve object to the current scene collection
         context.collection.objects.link(curve_obj)
+
+        # --- Initialize Radius Array using imported function ---
+        if not ensure_radius_array(curve_obj.data):
+            # Function reported an error
+            self.report({'WARNING'}, f"Could not initialize/verify radius array on '{curve_obj.name}'. Gizmos might not work.")
+            # Don't cancel the whole operator, just warn.
 
         # --- Final Selection & Cleanup ---
         bpy.ops.object.select_all(action='DESELECT') # Deselect all objects first

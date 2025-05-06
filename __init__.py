@@ -17,6 +17,7 @@ bl_info = {
 
 # --- Standard Imports ---
 import bpy
+import mathutils
 from mathutils import Vector, Matrix # Keep if needed by Visualize Op or Panel
 import bmesh
 
@@ -32,6 +33,7 @@ from .op_generate import OBJECT_OT_generate_cylinder_with_curve # Import Operato
 from .op_deform import OBJECT_OT_toggle_realtime_bend, deform_mesh_along_curve
 # Keep visualize operator if it exists in its own file or here
 # from .op_visualize import VISUALIZE_OT_curve_frames # Example if moved
+from .gizmo import PIECEGEN_GGT_radius_control, PIECEGEN_GIZMO_radius_handle
 
 # --- Scene Properties (Improved Readability) ---
 class CCDG_Properties(bpy.types.PropertyGroup):
@@ -596,6 +598,126 @@ class VISUALIZE_OT_curve_frames(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class TEST_OT_test_op(bpy.types.Operator):
+    bl_idname = "test.test_op"
+    bl_label = "Test"
+    bl_description = "A test operator"
+    bl_options = {'REGISTER'}
+
+    mouse_x : bpy.props.IntProperty()
+    mouse_y : bpy.props.IntProperty()
+
+    @classmethod
+    def poll(cls, context):
+        return True
+
+    def invoke(self, context, event):
+        self.mouse_x = event.mouse_x
+        self.mouse_y = event.mouse_y
+        return self.execute(context)
+
+    def execute(self, context):
+        print(f"Test operator: {self.mouse_x}, {self.mouse_y}")
+        return {'FINISHED'}
+
+
+class TEST_GT_test_gizmo(bpy.types.Gizmo):
+    bl_target_properties = (
+        {"id": "mouse_x", "type": 'INT'},
+        {"id": "mouse_y", "type": 'INT'},
+    )
+
+    def draw(self, context):
+        matrix = mathutils.Matrix.Translation((0.5, 0.5, 0.5))
+        self.draw_preset_box(matrix, select_id=0)
+
+    def draw_select(self, context, select_id=0):
+        matrix = mathutils.Matrix.Translation((0.5, 0.5, 0.5))
+        self.draw_preset_box(matrix, select_id=select_id)
+
+    def setup(self):
+        print(f"{self}: setup")
+
+    def modal(self, context, event, tweak):
+        self.target_set_value("mouse_x", event.mouse_x)
+        self.target_set_value("mouse_y", event.mouse_y)
+        return {'RUNNING_MODAL'}
+
+    def invoke(self, context, event):
+        print(f"{self}: invoke(event={event})")
+        return {'RUNNING_MODAL'}
+
+    def exit(self, context, cancel):
+        print(f"{self}: exit(cancel={cancel})")
+
+
+class TEST_GGT_test_group(bpy.types.GizmoGroup):
+    bl_label = "Test Widget"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'WINDOW'
+    bl_options = {'3D'} # 'TOOL_INIT' also sounds appropriate, but then the gizmo doesn't appear!
+    bl_operator = "test.test_op" # Just for the tooltip
+
+    @classmethod
+    def poll(cls, context):
+        return context.workspace.tools.from_space_view3d_mode(context.mode).idname == PIECEGEN_TOOL_test.bl_idname
+        # o = context.object
+        # return (o and o.select_get() and o.type == 'MESH')
+
+    def setup(self, context):
+        print(f"{self}: setup")
+        o = context.object
+        giz = self.gizmos.new("TEST_GT_test_gizmo")
+        giz.use_draw_modal = True # Is this necessary? (Makes no difference I can see)
+        giz.target_set_operator("test.test_op", index=0)
+        giz.matrix_basis = o.matrix_world.normalized()
+        giz.color = 1.0, 1.0, 1.0
+        giz.alpha = 0.5
+        giz.color_highlight = 1.0, 0.0, 0.0
+        giz.alpha_highlight = 1.0
+        self.gizmo = giz
+
+    def refresh(self, context):
+        print(f"{self}: refresh")
+        o = context.object
+        giz = self.gizmo
+        giz.matrix_basis = o.matrix_world.normalized()
+
+# --- Custom Workspace Tool (Minimal Definition) ---
+# https://github.com/blender/blender/blob/main/scripts/templates_py/ui_tool_simple.py
+# https://b3d.interplanety.org/en/creating-custom-tool-in-blender/
+class PIECEGEN_TOOL_test(bpy.types.WorkSpaceTool):
+    """Minimal tool definition for testing visibility."""
+    # 1. Define where the tool appears
+    bl_space_type = 'VIEW_3D'
+    # https://docs.blender.org/api/current/bpy_types_enum_items/context_mode_items.html
+    bl_context_mode = 'EDIT_CURVE'
+
+    # 2. Unique identifier
+    bl_idname = "piecegen.radius_edit_tool"
+
+    # 3. User-visible name and icon
+    bl_label = "PieceGen Edit Tool" # Simple label
+    bl_description = (
+        'Curve Deformer\n'
+    )
+    bl_icon = "brush.generic" # Use a guaranteed icon
+
+    bl_widget = "TEST_GGT_test_group"
+    # gizmo_group_properties = [
+    #     ("radius", 75.0),
+    #     ("backdrop_fill_alpha", 0.0),
+    # ]
+    # bl_keymap = (
+    #     # ('view3d.select_box',   {'type': 'LEFTMOUSE', 'value': 'CLICK_DRAG'},   None),
+    #     ("transform.translate", {"type": 'LEFTMOUSE', "value": 'PRESS'},        None),
+    # )
+
+    # 8. Optional: Draw settings in the header when active
+    def draw_settings(context, layout, tool):
+        layout.label(text="PieceGen Tool Active")
+
+
 # --- Registration ---
 # List of all classes from all modules that need to be registered with Blender
 classes = (
@@ -603,23 +725,30 @@ classes = (
     OBJECT_OT_generate_cylinder_with_curve, # From op_generate
     OBJECT_OT_toggle_realtime_bend,         # From op_deform (replaces enable/disable)
     VIEW3D_PT_piecegen_panel,               # Defined in this file (renamed)
-    VISUALIZE_OT_curve_frames               # Defined in this file
+    VISUALIZE_OT_curve_frames,              # Defined in this file
 )
 # Keep a reference to the handler function for registration/unregistration
 _handler_ref = ccdg_depsgraph_handler
 
 def register():
     """Registers all addon classes, properties, and the depsgraph handler."""
-    # (Registration logic unchanged from previous version)
+    
     print(f"Registering PieceGen addon (Toggle Workflow)..")
+    
     if HAS_NUMPY: print(f"- Numpy {np.__version__ if hasattr(np,'__version__') else ''} detected.")
     else: print("- Numpy not detected.")
+    
     for cls in classes:
         try: bpy.utils.register_class(cls)
         except ValueError: pass
+    gizmo.register()
+    
+    # bpy.utils.register_tool(PIECEGEN_TOOL_test, after={'builtin.transform'}, separator=True, group=True)
     setattr(bpy.types.Scene, 'ccdg_props', bpy.props.PointerProperty(type=CCDG_Properties))
+    
     cvars.MONITORED_MESH_OBJECTS.clear()
     cvars.original_coords_cache.clear()
+    
     if _handler_ref not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_handler_ref)
         print("- Realtime handler added.")
@@ -630,14 +759,21 @@ def unregister():
     """Unregisters all addon classes, properties, and removes the depsgraph handler."""
     # (Unregistration logic unchanged from previous version)
     print(f"Unregistering PieceGen addon..")
+    
     if _handler_ref in bpy.app.handlers.depsgraph_update_post:
         try: bpy.app.handlers.depsgraph_update_post.remove(_handler_ref); print("- Realtime handler removed.")
         except ValueError: print(f"- Warning: Realtime handler was already removed or not found.")
+    
     cvars.original_coords_cache.clear()
     cvars.MONITORED_MESH_OBJECTS.clear()
+    
     if hasattr(bpy.types.Scene, 'ccdg_props'):
         try: del bpy.types.Scene.ccdg_props
         except (AttributeError, Exception) as e: print(f"Warning: Could not delete scene property 'ccdg_props': {e}")
+
+    # bpy.utils.unregister_tool(PIECEGEN_TOOL_test)
+
+    gizmo.unregister()
     for cls in reversed(classes):
          if hasattr(bpy.types, cls.__name__):
             try: bpy.utils.unregister_class(cls)

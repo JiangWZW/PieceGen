@@ -281,6 +281,12 @@ class OBJECT_OT_toggle_realtime_bend(bpy.types.Operator):
                 self.report({'ERROR'}, f"Selected Target Curve '{curve_obj.name}' is not a valid Bezier curve with >= 2 points.")
                 return {'CANCELLED'}
 
+            # Ensure Radius Array Exists on Curve Data
+            if not bezier.ensure_radius_array(curve_obj.data):
+                # Function reported an error, cancel enabling deform
+                self.report({'ERROR'}, f"Could not initialize/verify radius array on '{curve_obj.name}'. Cannot start deform.")
+                return {'CANCELLED'}
+
             # Store original vertex data
             self.report({'INFO'}, f"Storing original shape for '{target_obj.name}'...")
             original_verts = [v.co.copy() for v in target_obj.data.vertices]
@@ -334,7 +340,7 @@ class OBJECT_OT_toggle_realtime_bend(bpy.types.Operator):
                 return {'FINISHED'}
             else:
                 # Clean up if initial deformation failed
-                target_obj.pop(cvars.PROP_ENABLED, None); target_obj.pop(cvars.PROP_CURVE_NAME, None)
+                target_obj.pop(cvars.PROP_ENABLED, None);    target_obj.pop(cvars.PROP_CURVE_NAME, None)
                 target_obj.pop(cvars.PROP_ORIG_VERTS, None); target_obj.pop(cvars.PROP_HEIGHT, None)
                 cvars.original_coords_cache.pop(target_obj.name, None)
                 cvars.MONITORED_MESH_OBJECTS.discard(target_obj.name)
