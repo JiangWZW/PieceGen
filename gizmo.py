@@ -120,7 +120,7 @@ class PIECEGEN_GIZMO_radius_handle(bpy.types.Gizmo):
         # The GizmoGroup setup aligns the gizmo's Z with curve tangent,
         # so the circle lies in the Normal/Binormal plane.
         self.draw_preset_circle(
-            matrix=Matrix.Identity(4) # No extra rotation needed relative to gizmo's matrix_basis
+            matrix=self.matrix_basis # Matrix.Identity(4) # No extra rotation needed relative to gizmo's matrix_basis
         )
 
     def draw_select(self, context, select_id):
@@ -298,14 +298,43 @@ class PIECEGEN_GGT_radius_control(bpy.types.GizmoGroup):
         active_tool = None
         try: active_tool = context.workspace.tools.from_space_view3d_mode(context.mode, create=False)
         except Exception: pass
+        
         tool_ok = active_tool and active_tool.idname == PIECEGEN_TOOL_radius_edit.bl_idname
         if not tool_ok: return False
-        obj = context.object
+        
         mode_ok = context.mode == 'EDIT_CURVE'
+        obj = context.object
         obj_ok = obj and obj.type == 'CURVE'
         data_ok = obj_ok and obj.data and obj.data.splines and len(obj.data.splines) > 0 and obj.data.splines[0].type == 'BEZIER'
         prop_ok = data_ok and cvars is not None and cvars.PROP_RADIUS_ARRAY in obj.data
         return mode_ok and prop_ok
+
+    def calc_curve_pt_matrix(i, num_points, spline, bp, mat_world, mat_world_normal): 
+        t_param = i / max(1, num_points - 1) if num_points > 1 else 0.0
+        tangent_local = bezier.evaluate_spline(spline, t_param, order=1)
+        if tangent_local.length_squared < 1e-9:
+                if i < num_points - 1: tangent_local = spline.bezier_points[i+1].co - bp.co
+                elif i > 0: tangent_local = bp.co - spline.bezier_points[i-1].co
+                else: tangent_local = bp.handle_right - bp.co
+        if tangent_local.length_squared > 1e-9: tangent_local.normalize()
+        else: tangent_local = Vector((0,0,1))
+        up = Vector((0,0,1))
+        if abs(tangent_local.dot(up)) > 0.999: up = Vector((0,1,0))
+        binormal_local = tangent_local.cross(up)
+        if binormal_local.length_squared < 1e-9: up = Vector((1,0,0)); binormal_local = tangent_local.cross(up)
+        if binormal_local.length_squared > 1e-9:
+                binormal_local.normalize(); normal_local = binormal_local.cross(tangent_local).normalized()
+        else: normal_local = Vector((0,1,0)); binormal_local = Vector((1,0,0))
+        tangent_world = (mat_world.to_3x3() @ tangent_local).normalized()
+        normal_world = (mat_world_normal @ normal_local).normalized()
+        binormal_world = (mat_world_normal @ binormal_local).normalized()
+        if tangent_world.length > 1e-6 and normal_world.length > 1e-6:
+            binormal_world = tangent_world.cross(normal_world).normalized()
+            normal_world = binormal_world.cross(tangent_world).normalized()
+        else: tangent_world=Vector((0,0,1)); normal_world=Vector((0,1,0)); binormal_world=Vector((1,0,0))
+        mat_rot = Matrix((binormal_world, normal_world, tangent_world)).transposed()
+
+        return mat_rot
 
     def setup(self, context):
         """Create gizmo instances for selected points and link to operator."""
@@ -348,22 +377,20 @@ class PIECEGEN_GGT_radius_control(bpy.types.GizmoGroup):
 
                 # --- Calculate Orientation Frame ---
                 t_param = i / max(1, num_points - 1) if num_points > 1 else 0.0
-                if bezier:
-                    tangent_local = bezier.evaluate_spline(spline, t_param, order=1)
-                    if tangent_local.length_squared < 1e-9:
-                         if i < num_points - 1: tangent_local = spline.bezier_points[i+1].co - bp.co
-                         elif i > 0: tangent_local = bp.co - spline.bezier_points[i-1].co
-                         else: tangent_local = bp.handle_right - bp.co
-                    if tangent_local.length_squared > 1e-9: tangent_local.normalize()
-                    else: tangent_local = Vector((0,0,1))
-                    up = Vector((0,0,1))
-                    if abs(tangent_local.dot(up)) > 0.999: up = Vector((0,1,0))
-                    binormal_local = tangent_local.cross(up)
-                    if binormal_local.length_squared < 1e-9: up = Vector((1,0,0)); binormal_local = tangent_local.cross(up)
-                    if binormal_local.length_squared > 1e-9:
-                         binormal_local.normalize(); normal_local = binormal_local.cross(tangent_local).normalized()
-                    else: normal_local = Vector((0,1,0)); binormal_local = Vector((1,0,0))
-                else: tangent_local = Vector((0,0,1)); normal_local = Vector((0,1,0)); binormal_local = Vector((1,0,0))
+                tangent_local = bezier.evaluate_spline(spline, t_param, order=1)
+                if tangent_local.length_squared < 1e-9:
+                        if i < num_points - 1: tangent_local = spline.bezier_points[i+1].co - bp.co
+                        elif i > 0: tangent_local = bp.co - spline.bezier_points[i-1].co
+                        else: tangent_local = bp.handle_right - bp.co
+                if tangent_local.length_squared > 1e-9: tangent_local.normalize()
+                else: tangent_local = Vector((0,0,1))
+                up = Vector((0,0,1))
+                if abs(tangent_local.dot(up)) > 0.999: up = Vector((0,1,0))
+                binormal_local = tangent_local.cross(up)
+                if binormal_local.length_squared < 1e-9: up = Vector((1,0,0)); binormal_local = tangent_local.cross(up)
+                if binormal_local.length_squared > 1e-9:
+                        binormal_local.normalize(); normal_local = binormal_local.cross(tangent_local).normalized()
+                else: normal_local = Vector((0,1,0)); binormal_local = Vector((1,0,0))
                 tangent_world = (mat_world.to_3x3() @ tangent_local).normalized()
                 normal_world = (mat_world_normal @ normal_local).normalized()
                 binormal_world = (mat_world_normal @ binormal_local).normalized()
@@ -421,10 +448,15 @@ class PIECEGEN_TOOL_radius_edit(bpy.types.WorkSpaceTool):
 
     bl_widget = "PIECEGEN_GGT_radius_control"
     bl_widget_properties = [
-        ("radius", 75.0),
-        ("backdrop_fill_alpha", 0.0),
+        # ("radius", 75.0),
+        # ("backdrop_fill_alpha", 0.0),
     ]
     bl_keymap = (
+        # Keep standard transform hotkeys
+        ("transform.transform", 
+            {'type':'H', 'value':'PRESS'}
+            , {'properties': []}
+        ),
         ("view3d.select",
             {'type': 'LEFTMOUSE', 'value': 'CLICK'}, 
             { 'properties': [
@@ -437,11 +469,6 @@ class PIECEGEN_TOOL_radius_edit(bpy.types.WorkSpaceTool):
             {'type': 'LEFTMOUSE', 'value': 'CLICK_DRAG'}, 
             {'properties': [('wait_for_input',False), ('mode','SET')]}
         ), 
-         # Keep standard transform hotkeys
-        ("transform.transform", 
-            {'type':'T', 'value':'PRESS'}, 
-            {'properties': [('cursor_transform',True)]}
-        ),
         # ("transform.rotate",    {'type':'R', 'value':'PRESS'}),
         # ("transform.scale",     {'type':'S', 'value':'PRESS'}),
         # Example: Alt+S for radius adjustment (like built-in)

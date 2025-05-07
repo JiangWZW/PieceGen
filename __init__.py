@@ -388,7 +388,6 @@ class VISUALIZE_OT_curve_frames(bpy.types.Operator):
         map_range_node.inputs['From Max'].default_value = 1.0
         map_range_node.inputs['To Min'].default_value = 0.0
         map_range_node.inputs['To Max'].default_value = 1.0
-        map_range_node.use_clamp = True # Ensure output is strictly within 0-1
 
         # Configure Color Ramp for gradient: Base Color -> Base Color -> White
         color_ramp = color_ramp_node.color_ramp
@@ -396,15 +395,15 @@ class VISUALIZE_OT_curve_frames(bpy.types.Operator):
         color_ramp.elements[0].position = 0.0
         color_ramp.elements[0].color = (*base_color[:3], 1.0) # Use input base color (ensure alpha is 1)
         # End color stop (at position 1.0) - Adjusted to 0.8 for more base color visibility
-        color_ramp.elements[1].position = 0.8 # White starts fading in later
+        color_ramp.elements[1].position = 1.0 # White starts fading in later
         color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0) # White color
         # Add an intermediate stop to hold the base color longer
         # Check if element exists before creating (important for script reload)
         if len(color_ramp.elements) < 3:
-            new_stop = color_ramp.elements.new(position=0.7) # Add stop at 70%
+            new_stop = color_ramp.elements.new(position=0.3) # Add stop at 70%
         else:
             new_stop = color_ramp.elements[2]
-            new_stop.position = 0.7 # Ensure position is correct on reload
+            new_stop.position = 0.3 # Ensure position is correct on reload
         new_stop.color = (*base_color[:3], 1.0) # Make intermediate stop the base color
 
         # Position nodes for better readability in Shader Editor (optional)
