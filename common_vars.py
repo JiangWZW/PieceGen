@@ -18,3 +18,4 @@ MONITORED_MESH_OBJECTS = set()
 # Cache for original vertex coordinates to avoid repeated unpacking in handler
 # Key: mesh object name (str), Value: list[Vector]
 original_coords_cache = {}
+
