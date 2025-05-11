@@ -34,6 +34,8 @@ from .op_deform import OBJECT_OT_toggle_realtime_bend, deform_mesh_along_curve
 # Keep visualize operator if it exists in its own file or here
 # from .op_visualize import VISUALIZE_OT_curve_frames # Example if moved
 from .gizmo import PIECEGEN_GGT_radius_control, PIECEGEN_GIZMO_radius_handle
+from . import op_custom_ui
+from . import gizmo
 
 # --- Scene Properties (Improved Readability) ---
 class CCDG_Properties(bpy.types.PropertyGroup):
@@ -51,33 +53,33 @@ class CCDG_Properties(bpy.types.PropertyGroup):
     cap_radius: bpy.props.FloatProperty(
         name="Radius",
         description="Generated cylinder radius",
-        default=1.0, min=0.01, # Avoid zero radius
+        default=0.3, min=0.01, # Avoid zero radius
         unit='LENGTH', # Use Blender's length units (e.g., meters)
         precision=3    # Display precision in the UI
     )
     height: bpy.props.FloatProperty(
         name="Height",
         description="Generated cylinder height (along local Z axis)",
-        default=2.0, min=0.01, # Avoid zero height
+        default=3.0, min=0.01, # Avoid zero height
         unit='LENGTH',
         precision=3
     )
     num_height_segs: bpy.props.IntProperty(
         name="Height Segments",
         description="Number of subdivisions along the cylinder height (more segments = smoother deformation)",
-        default=10, min=1, max=500 # Allow more segments if needed
+        default=24, min=1, max=500 # Allow more segments if needed
     )
     num_cpts_curve: bpy.props.IntProperty(
         name="Curve Points",
         description="Number of control points for the initial generated Bézier curve",
-        default=4, min=2, max=64 # Range for initial curve complexity
+        default=6, min=2, max=64 # Range for initial curve complexity
     )
     cap_fill_type: bpy.props.EnumProperty(
         name="Cap Fill Type",
         items=[('NGON', "N-Gon", "Fill caps with single N-Gon face (default)"),
                ('TRIANGLE_FAN', "Tri Fan", "Fill caps with triangle fan"),
                ('NOTHING', "Nothing", "Leave caps open")],
-        default='NGON',
+        default='NOTHING',
         description="How to fill the top and bottom faces of the cylinder"
     )
 
@@ -105,8 +107,8 @@ class CCDG_Properties(bpy.types.PropertyGroup):
 
 # --- Depsgraph Update Handler (Improved Readability) ---
 # This function runs automatically after Blender updates its dependency graph
-# @bpy.app.handlers.persistent # Uncomment if handler needs to persist across Blender file loads
-def ccdg_depsgraph_handler(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph):
+@bpy.app.handlers.persistent # Uncomment if handler needs to persist across Blender file loads
+def piecegen_handler_depsgraph_update_post(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph):
     """
     Checks for updates to monitored curves and triggers deformation on linked meshes.
     This function is registered with Blender's application handlers and runs frequently.
@@ -238,6 +240,67 @@ def ccdg_depsgraph_handler(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgrap
                 else:
                     # Missing necessary properties on the mesh object
                     print(f"Error Handler: Missing properties for {mesh_name} ({cvars.PROP_ORIG_VERTS=}, {cvars.PROP_HEIGHT=})")
+
+
+
+# This handler will run AFTER a .blend file is loaded
+@bpy.app.handlers.persistent # Make this handler persistent so it's active on startup after file load
+def piecegen_handler_on_load(scene): 
+    print("PieceGen: Running rebuild_monitored_state_on_load handler...")
+    
+    # Clear any existing monitored state from before file load (register() might also do this)
+    # It's important this runs AFTER your addon's normal register() if it also clears these.
+    # Or, ensure register() doesn't clear it if this handler is meant to be the sole populator on load.
+    # For now, let's assume register() clears, and this rebuilds.
+    cvars.MONITORED_MESH_OBJECTS.clear()
+    cvars.original_coords_cache.clear()
+    
+    print(f"  Cleared MONITORED_MESH_OBJECTS (now: {len(cvars.MONITORED_MESH_OBJECTS)}) and cache.")
+
+    # Iterate through all objects in all scenes, or just bpy.data.objects
+    # Using bpy.data.objects is simpler and covers all objects in the file.
+    for obj in bpy.data.objects:
+        if obj.type == 'MESH':
+            is_enabled = obj.get(cvars.PROP_ENABLED, False)
+            curve_name_prop = obj.get(cvars.PROP_CURVE_NAME)
+            
+            if is_enabled and curve_name_prop:
+                # This mesh was being monitored.
+                print(f"  Found previously monitored mesh: '{obj.name}', linked to curve (name from prop): '{curve_name_prop}'")
+                
+                # Verify the linked curve actually exists in the current file
+                if curve_name_prop not in bpy.data.objects:
+                    print(f"    Warning: Linked curve '{curve_name_prop}' for mesh '{obj.name}' no longer exists. Skipping.")
+                    # Optionally, clean up the properties on this mesh obj
+                    obj.pop(cvars.PROP_ENABLED, None)
+                    obj.pop(cvars.PROP_CURVE_NAME, None)
+                    continue
+
+                # Add to live monitoring set
+                cvars.MONITORED_MESH_OBJECTS.add(obj.name)
+                print(f"    Added '{obj.name}' to MONITORED_MESH_OBJECTS.")
+
+                # Optionally, pre-load original verts into cache
+                # This is useful if you don't want to unpack them on the first depsgraph update
+                packed_verts_str = obj.get(cvars.PROP_ORIG_VERTS)
+                if packed_verts_str:
+                    original_verts = unpack_verts_from_string(packed_verts_str)
+                    if original_verts:
+                        cvars.original_coords_cache[obj.name] = original_verts
+                        print(f"    Cached original verts for '{obj.name}'.")
+                    else:
+                        print(f"    Warning: Could not unpack original verts for '{obj.name}' from property.")
+                else:
+                    print(f"    Warning: Mesh '{obj.name}' enabled for deform but missing '{cvars.PROP_ORIG_VERTS}'.")
+            # else:
+                # print(f"  Mesh '{obj.name}' not enabled for PieceGen deform or no curve link.")
+                
+    print(f"PieceGen: Rebuild complete. Monitored meshes: {cvars.MONITORED_MESH_OBJECTS}")
+    # After rebuilding, you might want to trigger an initial deformation pass
+    # if any objects are now monitored, though the next depsgraph update should catch it.
+    # Forcing an update could be done by tagging objects, but usually not needed.
+
+
 
 
 # --- UI Panel ---
@@ -597,125 +660,6 @@ class VISUALIZE_OT_curve_frames(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class TEST_OT_test_op(bpy.types.Operator):
-    bl_idname = "test.test_op"
-    bl_label = "Test"
-    bl_description = "A test operator"
-    bl_options = {'REGISTER'}
-
-    mouse_x : bpy.props.IntProperty()
-    mouse_y : bpy.props.IntProperty()
-
-    @classmethod
-    def poll(cls, context):
-        return True
-
-    def invoke(self, context, event):
-        self.mouse_x = event.mouse_x
-        self.mouse_y = event.mouse_y
-        return self.execute(context)
-
-    def execute(self, context):
-        print(f"Test operator: {self.mouse_x}, {self.mouse_y}")
-        return {'FINISHED'}
-
-
-class TEST_GT_test_gizmo(bpy.types.Gizmo):
-    bl_target_properties = (
-        {"id": "mouse_x", "type": 'INT'},
-        {"id": "mouse_y", "type": 'INT'},
-    )
-
-    def draw(self, context):
-        matrix = mathutils.Matrix.Translation((0.5, 0.5, 0.5))
-        self.draw_preset_box(matrix, select_id=0)
-
-    def draw_select(self, context, select_id=0):
-        matrix = mathutils.Matrix.Translation((0.5, 0.5, 0.5))
-        self.draw_preset_box(matrix, select_id=select_id)
-
-    def setup(self):
-        print(f"{self}: setup")
-
-    def modal(self, context, event, tweak):
-        self.target_set_value("mouse_x", event.mouse_x)
-        self.target_set_value("mouse_y", event.mouse_y)
-        return {'RUNNING_MODAL'}
-
-    def invoke(self, context, event):
-        print(f"{self}: invoke(event={event})")
-        return {'RUNNING_MODAL'}
-
-    def exit(self, context, cancel):
-        print(f"{self}: exit(cancel={cancel})")
-
-
-class TEST_GGT_test_group(bpy.types.GizmoGroup):
-    bl_label = "Test Widget"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'WINDOW'
-    bl_options = {'3D'} # 'TOOL_INIT' also sounds appropriate, but then the gizmo doesn't appear!
-    bl_operator = "test.test_op" # Just for the tooltip
-
-    @classmethod
-    def poll(cls, context):
-        return context.workspace.tools.from_space_view3d_mode(context.mode).idname == PIECEGEN_TOOL_test.bl_idname
-        # o = context.object
-        # return (o and o.select_get() and o.type == 'MESH')
-
-    def setup(self, context):
-        print(f"{self}: setup")
-        o = context.object
-        giz = self.gizmos.new("TEST_GT_test_gizmo")
-        giz.use_draw_modal = True # Is this necessary? (Makes no difference I can see)
-        giz.target_set_operator("test.test_op", index=0)
-        giz.matrix_basis = o.matrix_world.normalized()
-        giz.color = 1.0, 1.0, 1.0
-        giz.alpha = 0.5
-        giz.color_highlight = 1.0, 0.0, 0.0
-        giz.alpha_highlight = 1.0
-        self.gizmo = giz
-
-    def refresh(self, context):
-        print(f"{self}: refresh")
-        o = context.object
-        giz = self.gizmo
-        giz.matrix_basis = o.matrix_world.normalized()
-
-# --- Custom Workspace Tool (Minimal Definition) ---
-# https://github.com/blender/blender/blob/main/scripts/templates_py/ui_tool_simple.py
-# https://b3d.interplanety.org/en/creating-custom-tool-in-blender/
-class PIECEGEN_TOOL_test(bpy.types.WorkSpaceTool):
-    """Minimal tool definition for testing visibility."""
-    # 1. Define where the tool appears
-    bl_space_type = 'VIEW_3D'
-    # https://docs.blender.org/api/current/bpy_types_enum_items/context_mode_items.html
-    bl_context_mode = 'EDIT_CURVE'
-
-    # 2. Unique identifier
-    bl_idname = "piecegen.radius_edit_tool"
-
-    # 3. User-visible name and icon
-    bl_label = "PieceGen Edit Tool" # Simple label
-    bl_description = (
-        'Curve Deformer\n'
-    )
-    bl_icon = "brush.generic" # Use a guaranteed icon
-
-    bl_widget = "TEST_GGT_test_group"
-    # gizmo_group_properties = [
-    #     ("radius", 75.0),
-    #     ("backdrop_fill_alpha", 0.0),
-    # ]
-    # bl_keymap = (
-    #     # ('view3d.select_box',   {'type': 'LEFTMOUSE', 'value': 'CLICK_DRAG'},   None),
-    #     ("transform.translate", {"type": 'LEFTMOUSE', "value": 'PRESS'},        None),
-    # )
-
-    # 8. Optional: Draw settings in the header when active
-    def draw_settings(context, layout, tool):
-        layout.label(text="PieceGen Tool Active")
-
 
 # --- Registration ---
 # List of all classes from all modules that need to be registered with Blender
@@ -727,7 +671,8 @@ classes = (
     VISUALIZE_OT_curve_frames,              # Defined in this file
 )
 # Keep a reference to the handler function for registration/unregistration
-_handler_ref = ccdg_depsgraph_handler
+_handler_ref = piecegen_handler_depsgraph_update_post
+
 
 def register():
     """Registers all addon classes, properties, and the depsgraph handler."""
@@ -740,17 +685,24 @@ def register():
     for cls in classes:
         try: bpy.utils.register_class(cls)
         except ValueError: pass
-    gizmo.register()
     
-    # bpy.utils.register_tool(PIECEGEN_TOOL_test, after={'builtin.transform'}, separator=True, group=True)
+    gizmo.register()
+
     setattr(bpy.types.Scene, 'ccdg_props', bpy.props.PointerProperty(type=CCDG_Properties))
     
     cvars.MONITORED_MESH_OBJECTS.clear()
     cvars.original_coords_cache.clear()
     
-    if _handler_ref not in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.append(_handler_ref)
-        print("- Realtime handler added.")
+    # Register depsgraph handler (ensure your logic here is robust for reloads)
+    if piecegen_handler_depsgraph_update_post not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(piecegen_handler_depsgraph_update_post)
+        print("- depsgraph handler added.")
+    
+    # Register the new load_post handler
+    if piecegen_handler_on_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(piecegen_handler_on_load)
+        print("- load_post handler added.")
+
     print(f"Registered.")
 
 
@@ -759,8 +711,12 @@ def unregister():
     # (Unregistration logic unchanged from previous version)
     print(f"Unregistering PieceGen addon..")
     
-    if _handler_ref in bpy.app.handlers.depsgraph_update_post:
-        try: bpy.app.handlers.depsgraph_update_post.remove(_handler_ref); print("- Realtime handler removed.")
+    if piecegen_handler_on_load in bpy.app.handlers.load_post:
+        try: bpy.app.handlers.load_post.remove(piecegen_handler_on_load); print("- load_post handler removed.")
+        except ValueError: print(f"- Warning: load_post was already removed or not found.")
+
+    if piecegen_handler_depsgraph_update_post in bpy.app.handlers.depsgraph_update_post:
+        try: bpy.app.handlers.depsgraph_update_post.remove(piecegen_handler_depsgraph_update_post); print("- depsgraph handler removed.")
         except ValueError: print(f"- Warning: Realtime handler was already removed or not found.")
     
     cvars.original_coords_cache.clear()
@@ -770,9 +726,8 @@ def unregister():
         try: del bpy.types.Scene.ccdg_props
         except (AttributeError, Exception) as e: print(f"Warning: Could not delete scene property 'ccdg_props': {e}")
 
-    # bpy.utils.unregister_tool(PIECEGEN_TOOL_test)
-
     gizmo.unregister()
+
     for cls in reversed(classes):
          if hasattr(bpy.types, cls.__name__):
             try: bpy.utils.unregister_class(cls)

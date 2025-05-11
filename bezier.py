@@ -138,6 +138,45 @@ def get_interpolated_tilt(spline: bpy.types.Spline, global_t: float) -> float:
     interpolated_tilt = tilt0 * (1.0 - local_t) + tilt1 * local_t
     return interpolated_tilt
 
+def get_interpolated_point_scale(spline: bpy.types.Spline, global_t: float, point_scales_list: list) -> Vector:
+    """
+    Gets the linearly interpolated (sx, sy, sz) scale vector at global t.
+    point_scales_list is the custom property from curve_data, e.g., [[sx,sy,sz], [sx,sy,sz], ...].
+    """
+    if not point_scales_list:
+        return Vector((1.0, 1.0, 1.0)) # Default scale if no data
+
+    num_points = len(spline.bezier_points)
+    if num_points == 0:
+        return Vector((1.0, 1.0, 1.0))
+    
+    if len(point_scales_list) != num_points:
+        # Data mismatch, return default. Should be ensured by the operator writing it.
+        print(f"Warning: Mismatch between bezier points ({num_points}) and scale data ({len(point_scales_list)})")
+        return Vector((1.0, 1.0, 1.0))
+
+    if num_points == 1:
+        return Vector(point_scales_list[0])
+
+    segment_index, local_t = get_spline_parameter_info(spline, global_t) # Your existing helper
+
+    # Clamp segment index for safety if mapping failed near ends
+    segment_index = max(0, min(segment_index, num_points - 2))
+
+    scale0_list = point_scales_list[segment_index]
+    scale1_list = point_scales_list[segment_index + 1]
+
+    s0 = Vector(scale0_list) # sx, sy, sz for start of segment
+    s1 = Vector(scale1_list) # sx, sy, sz for end of segment
+
+    # Linear interpolation for each component
+    interpolated_scale_vec = s0.lerp(s1, local_t)
+    
+    return interpolated_scale_vec
+
+
+
+
 # --- RMF Calculation Function ---
 def calculate_rmf_frames(spline: bpy.types.Spline, num_steps: int):
     """

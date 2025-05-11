@@ -10,8 +10,7 @@ from mathutils import Vector, Matrix, Euler
 from bpy_extras import view3d_utils # Needed for mouse projection
 
 from . import common_vars as cvars
-from . import bezier
-from . import common_utils as cutils
+from . import op_custom_ui
 
 PIXELS_PER_WORLD_UNIT = 30.0  # Gizmo circle will try to span this many pixels for each unit of data radius
 MIN_VISUAL_HANDLE_SIZE_PX = 8.0   # Minimum visual size of the handle on screen, in pixels
@@ -388,7 +387,7 @@ class PIECEGEN_GGT_radius_control(bpy.types.GizmoGroup):
     bl_label = "PieceGen Radius Control Gizmo"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'WINDOW'
-    bl_options = {'3D', 'SHOW_MODAL_ALL'}
+    bl_options = {'3D', 'SHOW_MODAL_ALL', 'SELECT'}
     
     @classmethod
     def poll(cls, context):
@@ -560,27 +559,20 @@ class PIECEGEN_GGT_radius_control(bpy.types.GizmoGroup):
 
     def draw_prepare(self, context):    
         self.update_from_curve(context)
-       
 
-class PIECEGEN_OT_gizmo_interaction_bridge(bpy.types.Operator):
-    bl_idname = "piecegen.gizmo_interaction_bridge"
-    bl_label = "PieceGen Gizmo Interaction Bridge"
-    bl_options = {'INTERNAL'} # Or {'REGISTER', 'UNDO'} if it makes sense, but INTERNAL is often for such bridges
+    def invoke_prepare(self, context, event):
+        print(f"GizmoGroup {self.bl_label} invoke_prepareD with event {event.type}")
+        # Now, iterate self.gizmos and manually do the test_select / select / invoke sequence
+        for gz in self.gizmos:
+            if isinstance(gz, PIECEGEN_GIZMO_radius_handle):
+                mouse_region_loc = (event.mouse_region_x, event.mouse_region_y)
+                hit_id = gz.test_select(context, mouse_region_loc)
+                if hit_id != -1 and hit_id == gz.select_id:
+                    if gz.select(context, event):
+                        return gz.invoke(context, event) # Let the individual gizmo run its modal
+        return {'PASS_THROUGH'}
+    
 
-    # Store which gizmo was activated to pass mouse events to it in modal
-    # This basic bridge might not even need its own modal if the gizmo's modal takes over fully.
-    # For now, let's assume the gizmo's invoke handles the modal setup.
-
-    first_mouse_x: bpy.props.IntProperty()
-    first_mouse_y: bpy.props.IntProperty()
-
-    def invoke(self, context, event):
-        if context.space_data.type == 'VIEW_3D':
-            wm = context.window_manager
-            wm.gizmo_group_type_ensure(PIECEGEN_GGT_radius_control.bl_idname)
-
-        # print("Bridge Op: No gizmo hit or successfully invoked")
-        return {'FINISHED'} # If no gizmo was hit and invoked
 
 # --- Custom Workspace Tool ---
 # https://github.com/blender/blender/blob/main/scripts/templates_py/ui_tool_simple.py
@@ -602,25 +594,22 @@ class PIECEGEN_TOOL_radius_edit(bpy.types.WorkSpaceTool):
     )
     bl_icon = "brush.generic" # Use a guaranteed icon
 
-    bl_widget = "PIECEGEN_GGT_radius_control"
-    bl_widget_properties = [
-        # ("radius", 75.0),
-        # ("backdrop_fill_alpha", 0.0),
-    ]
+    # bl_widget = "PIECEGEN_GGT_radius_control"
+    # bl_widget_properties = [
+    #     # ("radius", 75.0),
+    #     # ("backdrop_fill_alpha", 0.0),
+    # ]
     bl_keymap = (
         # This entry tells Blender to pass LEFTMOUSE PRESS events to the active gizmo group.
         # The gizmo group will then determine if any of its gizmos (like your radius handle)
         # are hit (via test_select) and then call their invoke/modal methods.
-        # (PIECEGEN_OT_gizmo_interaction_bridge.bl_idname,
-        #     {"type": 'LEFTMOUSE', "value": 'PRESS'},
-        #     None # No specific properties needed for the bridge op from keymap
-        # ),
+        (op_custom_ui.PIECEGEN_OT_modal_point_scale.bl_idname,
+            {"type": 'S', "value": 'PRESS', 'alt': True}, # User presses alt + 'S'
+            None
+        ),
+        # ("transform.scale",     {'type':'S', 'value':'PRESS'}),
 
-        # Keep standard transform hotkeys
-        # ("transform.transform", 
-        #     {'type':'H', 'value':'PRESS'}
-        #     , {'properties': []}
-        # ),
+        # Keep standard selection & transform hotkeys
         ("view3d.select",
             {'type': 'LEFTMOUSE', 'value': 'CLICK'}, 
             { 'properties': [
@@ -633,9 +622,11 @@ class PIECEGEN_TOOL_radius_edit(bpy.types.WorkSpaceTool):
             {'type': 'LEFTMOUSE', 'value': 'CLICK_DRAG'}, 
             {'properties': [('wait_for_input',False), ('mode','SET')]}
         ), 
-        # ("transform.rotate",    {'type':'R', 'value':'PRESS'}),
-        # ("transform.scale",     {'type':'S', 'value':'PRESS'}),
-        # Example: Alt+S for radius adjustment (like built-in)
+        ("transform.rotate",    {'type':'R', 'value':'PRESS'}),
+        ("transform.transform", 
+            {'type':'W', 'value':'PRESS'}
+            , {'properties': []}
+        ),
         # (PIECEGEN_OT_set_radius.bl_idname, {'type': 'S', 'value': 'PRESS', 'alt': True}),
     )
 
@@ -644,12 +635,14 @@ class PIECEGEN_TOOL_radius_edit(bpy.types.WorkSpaceTool):
         layout.label(text="PieceGen Tool Active")
 
 
+
+
 # --- Registration Helper ---
 gizmo_classes = (
-    PIECEGEN_OT_set_radius, 
-    PIECEGEN_GIZMO_radius_handle,
-    PIECEGEN_GGT_radius_control,
-    PIECEGEN_OT_gizmo_interaction_bridge, 
+    op_custom_ui.PIECEGEN_OT_modal_point_scale, 
+    # PIECEGEN_OT_set_radius, 
+    # PIECEGEN_GIZMO_radius_handle,
+    # PIECEGEN_GGT_radius_control,
 )
 
 def register():

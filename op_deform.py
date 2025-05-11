@@ -29,30 +29,28 @@ def deform_mesh_along_curve(target_mesh_obj: bpy.types.Object,
     Modifies mesh data directly. Uses numpy for speed if available.
     """
     mesh = target_mesh_obj.data
-
-    # --- Input Validation ---
-    if not curve_guide_obj or not curve_guide_obj.data or not isinstance(curve_guide_obj.data, bpy.types.Curve):
-        print(f"Error: Deform failed - Invalid curve object provided.")
-        return False
     curve_data = curve_guide_obj.data
-
-    if not curve_data.splines or len(curve_data.splines) == 0 or curve_data.splines[0].type != 'BEZIER':
-        print(f"Error: Deform failed - Curve's first spline must be BEZIER.")
-        return False
     spline = curve_data.splines[0] # Use the first spline
 
     # Check if spline has enough points
     if len(spline.bezier_points) < 2:
         print(f"Error: Deform failed - Bezier spline needs at least 2 control points.")
         return False
+    
+    # --- Retrieve Per-Point Scales ---
+    all_point_scales = None
+    if hasattr(curve_data, 'get') and cvars.PROP_POINT_SCALES in curve_data: # Check if property exists
+        all_point_scales = curve_data.get(cvars.PROP_POINT_SCALES)
+    if not all_point_scales:
+        print(f"Deform Warning: {cvars.PROP_POINT_SCALES} not found or invalid on curve '{curve_guide_obj.name}'. Using uniform scale 1,1,1.")
+        # Create a dummy list of [1,1,1] scales if not found, to prevent errors later
+        # This ensures deformation still happens, just without custom scaling.
+        num_spline_points = len(curve_data.splines[0].bezier_points) if curve_data.splines else 0
+        all_point_scales = [[1.0, 1.0, 1.0] for _ in range(num_spline_points)]
+
 
     vert_count = len(mesh.vertices)
-    if vert_count == 0 or not original_verts_coords or len(original_verts_coords) != vert_count:
-        print(f"Error: Deform failed - Vertex count mismatch or missing original data.")
-        return False
-    if cyl_height <= 1e-6:
-        print(f"Error: Deform failed - Invalid cylinder height ({cyl_height}).")
-        return False
+
     if rmf_steps < 2: rmf_steps = 2 # Ensure minimum steps for RMF logic
     influence_count = max(2, influence_count) # Need at least 2 for blending
 
@@ -131,6 +129,23 @@ def deform_mesh_along_curve(target_mesh_obj: bpy.types.Object,
         vertex_t = original_co.z / cyl_height
         vertex_t = max(0.0, min(1.0, vertex_t)) # Clamp t to [0, 1]
 
+        # --- Get Interpolated Per-Point Scale for this vertex_t ---
+        s_x, s_y, s_z = bezier.get_interpolated_point_scale(spline, vertex_t, all_point_scales)
+        # Note: s_z from get_interpolated_point_scale might not be directly used for cross-section
+        # if the cylinder's local Z is already mapped to the curve's length.
+        # s_x and s_y will scale the original_co.x and original_co.y.
+
+        # --- Apply Per-Point Scale to the Original Local XY Offset ---
+        # The original vertex's X and Y define its position on the cylinder's cross-section.
+        # original_co.z is used for mapping along the curve (vertex_t).
+        scaled_local_xy_offset_vec = Vector((
+            original_co.x * s_x,
+            original_co.y * s_y,
+            0.0  # Z component of offset is effectively handled by placing along curve;
+                 # s_z could optionally modulate segment length or thickness if desired.
+                 # For now, s_z is ignored for simple cross-section scaling.
+        ))
+
         # --- Find Influencing Frames and Calculate Weights ---
         # Determine the 'central' index based on t
         t_scaled = vertex_t * (num_rmf_frames - 1)
@@ -182,12 +197,8 @@ def deform_mesh_along_curve(target_mesh_obj: bpy.types.Object,
 
 
         # --- Apply Weighted Transformation ---
-        original_xy_offset_vec = Vector((original_co.x, original_co.y, 0.0))
-
-        # Blend Positions (Linear Interpolation)
-        final_world_pos = Vector((0.0, 0.0, 0.0))
-        # Blend Orientations (NLERP - Normalized Linear Quaternion Blending)
-        final_world_quat = Quaternion((0.0, 0.0, 0.0, 0.0)) # Accumulator
+        final_world_pos = Vector((0.0, 0.0, 0.0)) # Blend Positions (Linear Interpolation)
+        final_world_quat = Quaternion((0.0, 0.0, 0.0, 0.0)) # Blend Orientations (NLERP - Normalized Linear Quaternion Blending)
         ref_quat = None # Reference for consistent quaternion signs
 
         for k_idx, frame_idx in enumerate(influence_indices):
@@ -220,7 +231,7 @@ def deform_mesh_along_curve(target_mesh_obj: bpy.types.Object,
         mat_frame_world.translation = final_world_pos
 
         # Transform the original offset by the blended world matrix
-        world_pos_deformed = mat_frame_world @ original_xy_offset_vec
+        world_pos_deformed = mat_frame_world @ scaled_local_xy_offset_vec
 
         # Transform the final world position back into the target object's local space
         local_pos = target_inv_matrix @ world_pos_deformed
