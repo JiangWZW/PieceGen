@@ -33,9 +33,8 @@ from .op_generate import OBJECT_OT_generate_cylinder_with_curve # Import Operato
 from .op_deform import OBJECT_OT_toggle_realtime_bend, deform_mesh_along_curve
 # Keep visualize operator if it exists in its own file or here
 # from .op_visualize import VISUALIZE_OT_curve_frames # Example if moved
-from .gizmo import PIECEGEN_GGT_radius_control, PIECEGEN_GIZMO_radius_handle
-from . import op_custom_ui
 from . import gizmo
+from .common_vars import PieceGenPointScaleValues
 
 # --- Scene Properties (Improved Readability) ---
 class CCDG_Properties(bpy.types.PropertyGroup):
@@ -665,14 +664,12 @@ class VISUALIZE_OT_curve_frames(bpy.types.Operator):
 # List of all classes from all modules that need to be registered with Blender
 classes = (
     CCDG_Properties,                        # Defined in this file
+    PieceGenPointScaleValues,         # From common_vars
     OBJECT_OT_generate_cylinder_with_curve, # From op_generate
     OBJECT_OT_toggle_realtime_bend,         # From op_deform (replaces enable/disable)
     VIEW3D_PT_piecegen_panel,               # Defined in this file (renamed)
     VISUALIZE_OT_curve_frames,              # Defined in this file
 )
-# Keep a reference to the handler function for registration/unregistration
-_handler_ref = piecegen_handler_depsgraph_update_post
-
 
 def register():
     """Registers all addon classes, properties, and the depsgraph handler."""
@@ -687,9 +684,10 @@ def register():
         except ValueError: pass
     
     gizmo.register()
-
-    setattr(bpy.types.Scene, 'ccdg_props', bpy.props.PointerProperty(type=CCDG_Properties))
     
+    setattr(bpy.types.Scene, 'ccdg_props', bpy.props.PointerProperty(type=CCDG_Properties))
+    setattr(bpy.types.Curve, 'piecegen_custom_scales', bpy.props.CollectionProperty(type=PieceGenPointScaleValues))
+
     cvars.MONITORED_MESH_OBJECTS.clear()
     cvars.original_coords_cache.clear()
     
@@ -725,6 +723,9 @@ def unregister():
     if hasattr(bpy.types.Scene, 'ccdg_props'):
         try: del bpy.types.Scene.ccdg_props
         except (AttributeError, Exception) as e: print(f"Warning: Could not delete scene property 'ccdg_props': {e}")
+    if hasattr(bpy.types.Curve, 'piecegen_custom_scales'):
+        try: del bpy.types.Curve.piecegen_custom_scales
+        except (AttributeError, Exception) as e: print(f"Warning: Could not delete curve property 'piecegen_custom_scales': {e}")
 
     gizmo.unregister()
 

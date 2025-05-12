@@ -605,7 +605,7 @@ class PIECEGEN_TOOL_radius_edit(bpy.types.WorkSpaceTool):
         # are hit (via test_select) and then call their invoke/modal methods.
         (op_custom_ui.PIECEGEN_OT_modal_point_scale.bl_idname,
             {"type": 'S', "value": 'PRESS', 'alt': True}, # User presses alt + 'S'
-            None
+            {'properties': []}
         ),
         # ("transform.scale",     {'type':'S', 'value':'PRESS'}),
 
@@ -622,7 +622,10 @@ class PIECEGEN_TOOL_radius_edit(bpy.types.WorkSpaceTool):
             {'type': 'LEFTMOUSE', 'value': 'CLICK_DRAG'}, 
             {'properties': [('wait_for_input',False), ('mode','SET')]}
         ), 
-        ("transform.rotate",    {'type':'R', 'value':'PRESS'}),
+        ("transform.rotate", 
+            {'type':'R', 'value':'PRESS'}, 
+            {'properties': []}
+        ),
         ("transform.transform", 
             {'type':'W', 'value':'PRESS'}
             , {'properties': []}

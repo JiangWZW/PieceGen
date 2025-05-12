@@ -38,15 +38,16 @@ def deform_mesh_along_curve(target_mesh_obj: bpy.types.Object,
         return False
     
     # --- Retrieve Per-Point Scales ---
-    all_point_scales = None
-    if hasattr(curve_data, 'get') and cvars.PROP_POINT_SCALES in curve_data: # Check if property exists
-        all_point_scales = curve_data.get(cvars.PROP_POINT_SCALES)
+    all_point_scales = curve_data.piecegen_custom_scales
     if not all_point_scales:
-        print(f"Deform Warning: {cvars.PROP_POINT_SCALES} not found or invalid on curve '{curve_guide_obj.name}'. Using uniform scale 1,1,1.")
+        print(f"Deform Warning: 'piecegen_custom_scales' not found or invalid on curve '{curve_guide_obj.name}'. Using uniform scale 1,1,1.")
         # Create a dummy list of [1,1,1] scales if not found, to prevent errors later
         # This ensures deformation still happens, just without custom scaling.
-        num_spline_points = len(curve_data.splines[0].bezier_points) if curve_data.splines else 0
-        all_point_scales = [[1.0, 1.0, 1.0] for _ in range(num_spline_points)]
+        num_bezier_points = len(curve_data.splines[0].bezier_points) if curve_data.splines else 0
+        # Ensure collection has enough items
+        while len(all_point_scales) < num_bezier_points:
+            prop_pt_scale: cvars.PieceGenPointScaleValues = all_point_scales.add()
+            prop_pt_scale.scale = (1, 1, 1)
 
 
     vert_count = len(mesh.vertices)
@@ -130,7 +131,7 @@ def deform_mesh_along_curve(target_mesh_obj: bpy.types.Object,
         vertex_t = max(0.0, min(1.0, vertex_t)) # Clamp t to [0, 1]
 
         # --- Get Interpolated Per-Point Scale for this vertex_t ---
-        s_x, s_y, s_z = bezier.get_interpolated_point_scale(spline, vertex_t, all_point_scales)
+        s_x, s_y, s_z = bezier.get_interpolated_point_scale(spline, vertex_t, list(all_point_scales))
         # Note: s_z from get_interpolated_point_scale might not be directly used for cross-section
         # if the cylinder's local Z is already mapped to the curve's length.
         # s_x and s_y will scale the original_co.x and original_co.y.

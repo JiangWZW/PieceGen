@@ -3,7 +3,7 @@ import gpu
 from gpu_extras.batch import batch_for_shader # For easier drawing
 from mathutils import Vector, Matrix
 
-from .common_vars import PROP_POINT_SCALES
+from . import common_vars as cvars
 
 
 class PIECEGEN_OT_modal_point_scale(bpy.types.Operator):
@@ -160,7 +160,19 @@ class PIECEGEN_OT_modal_point_scale(bpy.types.Operator):
         curve_data = obj.data
         spline = curve_data.splines[0]
 
-        # Initialize Python instance attributes for modal state
+        # --- Initialize or retrieve custom scale property from curve data ---
+        scales_collection: bpy.props.CollectionProperty = curve_data.piecegen_custom_scales
+        num_bezier_points = len(spline.bezier_points)
+        # Ensure collection has enough items
+        while len(scales_collection) < num_bezier_points:
+            prop_pt_scale: cvars.PieceGenPointScaleValues = scales_collection.add()
+            prop_pt_scale.scale = (1, 1, 1)
+        # Trim if too many (e.g., if curve points were deleted)
+        while len(scales_collection) > num_bezier_points:
+            scales_collection.remove(len(scales_collection) - 1)
+
+
+        # --- Initialize Python instance attributes for modal state ---
         self.active_curve_ob_name = obj.name
         self.initial_mouse_x = event.mouse_x # Standard Python int
         self.initial_mouse_y = event.mouse_y
@@ -170,37 +182,18 @@ class PIECEGEN_OT_modal_point_scale(bpy.types.Operator):
             self.report({'INFO'}, "No curve points selected to scale.")
             return {'CANCELLED'}
 
-        # Initialize or retrieve custom scale property from curve data
-        if PROP_POINT_SCALES not in curve_data or \
-           not isinstance(curve_data.get(PROP_POINT_SCALES), list) or \
-           len(curve_data[PROP_POINT_SCALES]) != len(spline.bezier_points):
-            curve_data[PROP_POINT_SCALES] = [[1.0, 1.0, 1.0] for _ in range(len(spline.bezier_points))]
-            # print("PieceGen Scale: Initialized PROP_POINT_SCALES.")
-        
-        all_point_scales_prop = curve_data[PROP_POINT_SCALES]
         self.initial_scales_per_point = [] 
         selected_points_coords_local = []
 
         for idx in self.selected_point_indices:
             # Ensure index is within bounds for all_point_scales_prop
-            if idx < len(all_point_scales_prop):
-                self.initial_scales_per_point.append(list(all_point_scales_prop[idx]))
-            else: # Should not happen if PROP_POINT_SCALES is correctly sized
+            if idx < len(scales_collection):
+                self.initial_scales_per_point.append(list(scales_collection[idx]))
+            else: 
                 self.initial_scales_per_point.append([1.0, 1.0, 1.0]) # Fallback default
             
-            # Ensure index is within bounds for spline.bezier_points
             if idx < len(spline.bezier_points):
                  selected_points_coords_local.append(spline.bezier_points[idx].co.copy())
-            else: # Should also not happen
-                 self.report({'ERROR'}, f"Selected point index {idx} is out of bounds for bezier points.")
-                 # Decide how to handle - cancel or use a fallback for pivot
-                 # For now, let's rely on selected_point_indices being valid.
-                 pass
-
-
-        if not selected_points_coords_local: # Should be caught by "no selected_point_indices"
-            self.report({'ERROR'}, "No valid coordinates for selected points to calculate pivot.")
-            return {'CANCELLED'}
             
         pivot_local = sum(selected_points_coords_local, Vector()) / len(selected_points_coords_local)
         self.pivot_point_world = obj.matrix_world @ pivot_local
@@ -208,16 +201,11 @@ class PIECEGEN_OT_modal_point_scale(bpy.types.Operator):
         self.live_scale_factors = Vector((1.0, 1.0, 1.0)) 
         self.constraint_axis_str = "XYZ"
 
-        # Initialize shader (once per operator class, if not already)
+        # --- Initialize shader (once per operator class, if not already) ---
         if PIECEGEN_OT_modal_point_scale.shader_builtin_flat_color is None:
             PIECEGEN_OT_modal_point_scale.shader_builtin_flat_color = gpu.shader.from_builtin('FLAT_COLOR')
-            if PIECEGEN_OT_modal_point_scale.shader_builtin_flat_color is None:
-                self.report({'ERROR'}, "Failed to initialize 3D shader for drawing.")
-                # Cannot draw visuals, but operator might still function without them
-                # For now, let's allow it to continue if shader fails, but visuals won't appear.
-                # Alternatively, return {'CANCELLED'}
 
-        # Add draw handler
+        # --- Add draw handler ---
         self._draw_args = (self, context) 
         self._draw_handler = bpy.types.SpaceView3D.draw_handler_add(
             PIECEGEN_OT_modal_point_scale._draw_callback_wrapper,
@@ -250,23 +238,14 @@ class PIECEGEN_OT_modal_point_scale(bpy.types.Operator):
         
         if cancelled:
             obj = context.scene.objects.get(self.active_curve_ob_name if hasattr(self, 'active_curve_ob_name') else None)
-            if obj and obj.type == 'CURVE' and obj.data and \
-               hasattr(self, 'selected_point_indices') and \
-               hasattr(self, 'initial_scales_per_point'):
-                
-                all_point_scales_prop = obj.data.get(PROP_POINT_SCALES)
-                if all_point_scales_prop and isinstance(all_point_scales_prop, list):
-                    for i, point_idx in enumerate(self.selected_point_indices):
-                        if point_idx < len(all_point_scales_prop) and i < len(self.initial_scales_per_point):
-                            initial_s = self.initial_scales_per_point[i]
-                            # Assuming all_point_scales_prop stores list of lists/Vectors
-                            # And initial_s is also a list [sx, sy, sz]
-                            if isinstance(all_point_scales_prop[point_idx], list) and len(all_point_scales_prop[point_idx]) == 3:
-                                all_point_scales_prop[point_idx][0] = initial_s[0]
-                                all_point_scales_prop[point_idx][1] = initial_s[1]
-                                all_point_scales_prop[point_idx][2] = initial_s[2]
-                    obj.data.update_tag()
-                    context.area.tag_redraw()
+            if obj and obj.type == 'CURVE' and obj.data: 
+                scales_collection = obj.data.piecegen_custom_scales
+                for i, point_idx in enumerate(self.selected_point_indices):
+                    initial_s_vec = self.initial_scales_per_point[i]
+                    scales_collection[point_idx].scale = initial_s_vec # Restore the Vector
+                    
+                obj.data.update_tag()
+                context.area.tag_redraw()
 
     def modal(self, context, event):
         if not self._is_valid_state(context, check_level='modal'):
@@ -277,7 +256,7 @@ class PIECEGEN_OT_modal_point_scale(bpy.types.Operator):
         obj = context.scene.objects.get(self.active_curve_ob_name)
         
         curve_data = obj.data
-        all_point_scales_prop = curve_data.get(PROP_POINT_SCALES)
+        scales_collection = curve_data.piecegen_custom_scales
 
         context.area.tag_redraw() # Request redraw for draw handler
 
@@ -344,12 +323,13 @@ class PIECEGEN_OT_modal_point_scale(bpy.types.Operator):
             self.live_scale_factors = Vector((sfx, sfy, sfz))
 
             for i, point_idx in enumerate(self.selected_point_indices):
-                if point_idx < len(all_point_scales_prop) and i < len(self.initial_scales_per_point):
+                if point_idx < len(scales_collection) and i < len(self.initial_scales_per_point):
                     initial_s = self.initial_scales_per_point[i]
-                    if len(all_point_scales_prop[point_idx]) == 3:
-                        all_point_scales_prop[point_idx][0] = initial_s[0] * self.live_scale_factors.x
-                        all_point_scales_prop[point_idx][1] = initial_s[1] * self.live_scale_factors.y
-                        all_point_scales_prop[point_idx][2] = initial_s[2] * self.live_scale_factors.z
+                    scales_collection[point_idx].scale = (
+                        initial_s[0] * self.live_scale_factors.x, 
+                        initial_s[1] * self.live_scale_factors.y, 
+                        initial_s[2] * self.live_scale_factors.z
+                    )
             
             curve_data.update_tag() # Essential for depsgraph update
             self._update_header_text(context)
@@ -380,12 +360,10 @@ class PIECEGEN_OT_modal_point_scale(bpy.types.Operator):
                 self.live_scale_factors = Vector((1.0,1.0,1.0))
                 # Restore scales to initial_scales before applying new constraint from neutral factors
                 for i, point_idx in enumerate(self.selected_point_indices):
-                     if point_idx < len(all_point_scales_prop) and i < len(self.initial_scales_per_point):
+                     if point_idx < len(scales_collection) and i < len(self.initial_scales_per_point):
                         initial_s = self.initial_scales_per_point[i]
-                        if isinstance(all_point_scales_prop[point_idx], list) and len(all_point_scales_prop[point_idx]) == 3:
-                            all_point_scales_prop[point_idx][0] = initial_s[0]
-                            all_point_scales_prop[point_idx][1] = initial_s[1]
-                            all_point_scales_prop[point_idx][2] = initial_s[2]
+                        scales_collection[point_idx].scale = (initial_s[0], initial_s[1], initial_s[2])
+                        
                 curve_data.update_tag()
                 self._update_header_text(context)
 
@@ -424,15 +402,6 @@ class PIECEGEN_OT_modal_point_scale(bpy.types.Operator):
             self.current_curve_object = obj # Store for easy access if valid
             self.current_curve_data = curve_data
             self.current_spline = curve_data.splines[0]
-
-        if check_level in ['invoke_post_init', 'modal', 'draw']:
-            # Check PROP_POINT_SCALES on the curve data
-            if PROP_POINT_SCALES not in self.current_curve_data or \
-               not isinstance(self.current_curve_data.get(PROP_POINT_SCALES), list) or \
-               len(self.current_curve_data[PROP_POINT_SCALES]) != len(self.current_spline.bezier_points):
-                if check_level != 'draw':
-                    self.report({'ERROR'}, f"{PROP_POINT_SCALES} invalid or desynced. Try re-initializing on curve.")
-                return False
 
         if check_level == 'draw': # Specific checks for drawing visuals
             if PIECEGEN_OT_modal_point_scale.shader_builtin_flat_color is None:

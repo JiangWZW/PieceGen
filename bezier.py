@@ -3,6 +3,7 @@ import math
 from mathutils import Vector, Matrix
 
 from . import common_vars as cvars
+from .common_vars import *
 
 # --- Helper: Bezier Curve Derivatives ---
 
@@ -138,6 +139,7 @@ def get_interpolated_tilt(spline: bpy.types.Spline, global_t: float) -> float:
     interpolated_tilt = tilt0 * (1.0 - local_t) + tilt1 * local_t
     return interpolated_tilt
 
+
 def get_interpolated_point_scale(spline: bpy.types.Spline, global_t: float, point_scales_list: list) -> Vector:
     """
     Gets the linearly interpolated (sx, sy, sz) scale vector at global t.
@@ -163,11 +165,11 @@ def get_interpolated_point_scale(spline: bpy.types.Spline, global_t: float, poin
     # Clamp segment index for safety if mapping failed near ends
     segment_index = max(0, min(segment_index, num_points - 2))
 
-    scale0_list = point_scales_list[segment_index]
-    scale1_list = point_scales_list[segment_index + 1]
+    scale0_list: PieceGenPointScaleValues = point_scales_list[segment_index]
+    scale1_list: PieceGenPointScaleValues = point_scales_list[segment_index + 1]
 
-    s0 = Vector(scale0_list) # sx, sy, sz for start of segment
-    s1 = Vector(scale1_list) # sx, sy, sz for end of segment
+    s0 = Vector(scale0_list.scale) # sx, sy, sz for start of segment
+    s1 = Vector(scale1_list.scale) # sx, sy, sz for end of segment
 
     # Linear interpolation for each component
     interpolated_scale_vec = s0.lerp(s1, local_t)
